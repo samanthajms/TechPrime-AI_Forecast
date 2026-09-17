@@ -39,10 +39,15 @@ FUNCTIONS PROVIDED:
 """
 
 import json
+import os
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import mysql.connector
+from dotenv import load_dotenv
 from pathlib import Path
+
+load_dotenv()  # reads testing.env (or .env) for local DB credentials
 
 BASE_DIR = Path(__file__).parent
 
@@ -52,7 +57,13 @@ CATEGORY_MAP_PATH = BASE_DIR / 'category_code_map.json'
 CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
 PRODUCT_SHARE_PATH = BASE_DIR / 'product_category_share.csv'
-TRANSACTIONS_PATH = '/mnt/user-data/outputs/For-sample.xlsx'  # swap for a DB query in production
+
+DB_CONFIG = {
+    'host': os.environ.get('DB_HOST', 'localhost'),
+    'user': os.environ.get('DB_USER', 'root'),
+    'password': os.environ.get('DB_PASSWORD', ''),
+    'database': os.environ.get('DB_NAME', 'ias_ecommerce'),
+}
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
@@ -82,24 +93,31 @@ _product_share = pd.read_csv(PRODUCT_SHARE_PATH)
 # -----------------------------------------------------------------
 def _load_transactions():
     """
-    Returns cleaned, demand-only transaction rows.
-    SWAP THIS to a real query, e.g.:
+    Queries your real local MySQL (ias_ecommerce, via XAMPP) for order history.
 
-        return db.query('''
-            SELECT order_date AS "POS Order Date", category AS "Category",
-                   product_name AS "Product Name", quantity AS "Quantity",
-                   unit_price AS "Unit Price", total AS "Total Sales VAT Inclusive"
-            FROM sales_transactions
-            WHERE quantity > 0 AND category != 'Customer Advances'
-        ''')
+    Schema note: `orders.status` is one of 'to_pay','to_ship','to_receive',
+    'to_review' (see database/ias_ecommerce.sql). 'to_pay' means payment was
+    never completed -- excluded here since it isn't a real sale.
     """
-    df = pd.read_excel(TRANSACTIONS_PATH)
-    df = df[df['Category'] != 'Customer Advances']
-    df = df[df['Quantity'] > 0]
+    conn = mysql.connector.connect(**DB_CONFIG)
+    query = """
+        SELECT
+            o.created_at AS `POS Order Date`,
+            p.category   AS `Category`,
+            p.name       AS `Product Name`,
+            oi.quantity  AS `Quantity`,
+            oi.price     AS `Unit Price`,
+            (oi.quantity * oi.price) AS `Total Sales VAT Inclusive`
+        FROM order_items oi
+        JOIN orders o   ON oi.order_id = o.id
+        JOIN products p ON oi.product_id = p.id
+        WHERE o.status != 'to_pay'
+          AND oi.quantity > 0
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
     df['POS Order Date'] = pd.to_datetime(df['POS Order Date'])
-    cols = ['POS Order Date', 'Category', 'Product Name', 'Quantity',
-            'Unit Price', 'Total Sales VAT Inclusive']
-    return df[cols]
+    return df
 
 
 def _resolve_category(category=None, product=None):
