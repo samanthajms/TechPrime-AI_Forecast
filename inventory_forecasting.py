@@ -47,7 +47,7 @@ import mysql.connector
 from dotenv import load_dotenv
 from pathlib import Path
 
-load_dotenv()  # reads testing.env (or .env) for local DB credentials
+load_dotenv() 
 
 BASE_DIR = Path(__file__).parent
 
@@ -62,7 +62,7 @@ DB_CONFIG = {
     'host': os.environ.get('DB_HOST', 'localhost'),
     'user': os.environ.get('DB_USER', 'root'),
     'password': os.environ.get('DB_PASSWORD', ''),
-    'database': os.environ.get('DB_NAME', 'ias_ecommerce'),
+    'database': os.environ.get('DB_NAME', 'techprime_ai'),
 }
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
@@ -92,32 +92,16 @@ _product_share = pd.read_csv(PRODUCT_SHARE_PATH)
 # Internal: data access layer -- REPLACE THIS FOR PRODUCTION
 # -----------------------------------------------------------------
 def _load_transactions():
-    """
-    Queries your real local MySQL (ias_ecommerce, via XAMPP) for order history.
-
-    Schema note: `orders.status` is one of 'to_pay','to_ship','to_receive',
-    'to_review' (see database/ias_ecommerce.sql). 'to_pay' means payment was
-    never completed -- excluded here since it isn't a real sale.
-    """
-    conn = mysql.connector.connect(**DB_CONFIG)
-    query = """
-        SELECT
-            o.created_at AS `POS Order Date`,
-            p.category   AS `Category`,
-            p.name       AS `Product Name`,
-            oi.quantity  AS `Quantity`,
-            oi.price     AS `Unit Price`,
-            (oi.quantity * oi.price) AS `Total Sales VAT Inclusive`
-        FROM order_items oi
-        JOIN orders o   ON oi.order_id = o.id
-        JOIN products p ON oi.product_id = p.id
-        WHERE o.status != 'to_pay'
-          AND oi.quantity > 0
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
+    """Reads from the local sample file for testing."""
+    # Ensure this path points exactly to where your sample Excel file is saved!
+    df = pd.read_excel('D:/xampp/htdocs/TechPrime-AI_Forecast/For-sample.xlsx')
+    
+    df = df[df['Category'] != 'Customer Advances']
+    df = df[df['Quantity'] > 0]
     df['POS Order Date'] = pd.to_datetime(df['POS Order Date'])
-    return df
+    cols = ['POS Order Date', 'Category', 'Product Name', 'Quantity',
+            'Unit Price', 'Total Sales VAT Inclusive']
+    return df[cols]
 
 
 def _resolve_category(category=None, product=None):

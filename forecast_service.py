@@ -1,14 +1,11 @@
 from flask import Flask, request, jsonify
 import inventory_forecasting as forecast
 import os
+print("URL:", os.getenv("php -f TechPrime-AI/forecast_api.php"))
+print("KEY:", str(os.getenv("sb_publishable_McnJFvYwmb6_CDyHIh8JzA_qdPe2-ir"))[:10] + "...")
 from pathlib import Path
 from dotenv import load_dotenv
-
-# load_dotenv() with no arguments only looks for a file named exactly ".env" --
-# it silently does NOT find "testing.env", which meant FORECAST_API_KEY was
-# never actually loaded, and the auth check below was comparing against None
-# (i.e. every request with no key passed, every request WITH the real key failed).
-load_dotenv(Path(__file__).parent / 'testing.env')
+load_dotenv(Path(__file__).parent / '.env')
 
 app = Flask(__name__)
 

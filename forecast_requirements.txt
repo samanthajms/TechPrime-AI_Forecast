@@ -3,4 +3,4 @@ python-dotenv
 xgboost
 pandas
 numpy
-mysql-connector-python
+psycopg2-binary
