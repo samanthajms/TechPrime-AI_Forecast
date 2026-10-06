@@ -43,11 +43,12 @@ import os
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-import mysql.connector
+import functools
+import category_alignment as ca
 from dotenv import load_dotenv
 from pathlib import Path
 
-load_dotenv() 
+load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 
@@ -56,14 +57,8 @@ REVENUE_MODEL_PATH = BASE_DIR / 'xgb_monthly_revenue_model.json'
 CATEGORY_MAP_PATH = BASE_DIR / 'category_code_map.json'
 CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
-PRODUCT_SHARE_PATH = BASE_DIR / 'product_category_share.csv'
-
-DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', 'localhost'),
-    'user': os.environ.get('DB_USER', 'root'),
-    'password': os.environ.get('DB_PASSWORD', ''),
-    'database': os.environ.get('DB_NAME', 'techprime_ai'),
-}
+PRODUCT_SHARE_PATH = BASE_DIR / 'product_category_share.csv'  # legacy, no longer used
+HISTORY_PATH = Path(os.environ.get('HISTORY_PATH', BASE_DIR / 'preprocessed_monthly_product_features.csv'))
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
@@ -85,48 +80,77 @@ with open(CATEGORY_MAP_PATH) as f:
 
 _cat_confidence = pd.read_csv(CATEGORY_CONFIDENCE_PATH).set_index('Category')
 _revenue_confidence = pd.read_csv(REVENUE_CONFIDENCE_PATH).set_index('Category')
-_product_share = pd.read_csv(PRODUCT_SHARE_PATH)
 
 
 # -----------------------------------------------------------------
 # Internal: data access layer -- REPLACE THIS FOR PRODUCTION
 # -----------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _history():
+    """Monthly PRODUCT history (with product names). Written by build_product_history.py (legacy POS)
+    or by the live-DB rebuild job -- same columns either way."""
+    h = pd.read_csv(HISTORY_PATH, dtype={'MSKU': str})
+    h['Category'] = h['Category'].str.strip().str.upper()          # MODEL category (what the models are trained on)
+    if 'Shop Category' not in h.columns:                           # older file without shop columns -> derive
+        cls = {m: ca.classify_product(m, n, c) for m, n, c in
+               h.drop_duplicates('MSKU')[['MSKU', 'Product Name', 'Category']].itertuples(index=False)}
+        h['Shop Group'] = h['MSKU'].map(lambda m: cls[m][1])
+        h['Shop Category'] = h['MSKU'].map(lambda m: cls[m][2])
+    return h
+
+
+def reload_history():
+    _history.cache_clear(); _product_shares.cache_clear(); _product_forecast.cache_clear(); ca.reload_map()
+
+
 def _load_transactions():
-    """Reads from the local sample file for testing."""
-    # Ensure this path points exactly to where your sample Excel file is saved!
-    df = pd.read_excel('D:/xampp/htdocs/TechPrime-AI_Forecast/For-sample.xlsx')
-    
-    df = df[df['Category'] != 'Customer Advances']
-    df = df[df['Quantity'] > 0]
-    df['POS Order Date'] = pd.to_datetime(df['POS Order Date'])
-    cols = ['POS Order Date', 'Category', 'Product Name', 'Quantity',
-            'Unit Price', 'Total Sales VAT Inclusive']
-    return df[cols]
+    """Compatibility shim: exposes the monthly product history in the transaction-like shape
+    the rest of this module expects (one row per product-month)."""
+    h = _history()
+    return pd.DataFrame({
+        'POS Order Date': pd.to_datetime(h['Month'] + '-01'),
+        'Category': h['Category'], 'Product Name': h['Product Name'], 'MSKU': h['MSKU'],
+        'Quantity': h['units_sold'], 'Unit Price': h['avg_price'],
+        'Total Sales VAT Inclusive': h['revenue'],
+    })
+
+
+@functools.lru_cache(maxsize=1)
+def _product_shares(window=12, active_within=6):
+    """Top-down allocation weights from the LAST `window` months, only for products that sold in the last
+    `active_within` months. Units use unit share; revenue uses REVENUE share (a GPU and a cable have
+    very different prices, so revenue must not be allocated by unit share)."""
+    h = _history()
+    months = sorted(h['Month'].unique())
+    recent = h[h['Month'].isin(months[-window:])]
+    active = set(h[h['Month'].isin(months[-active_within:])]['MSKU'])
+    g = recent[recent['MSKU'].isin(active)].groupby(['Category', 'MSKU']).agg(
+        units=('units_sold', 'sum'), revenue=('revenue', 'sum'),
+        months_active=('Month', 'nunique')).reset_index()
+    last = h.sort_values('Month').groupby('MSKU')[['Product Name', 'Shop Group', 'Shop Category']].last()
+    g['Product Name'] = g['MSKU'].map(last['Product Name'])
+    g['Shop Group'] = g['MSKU'].map(last['Shop Group'])
+    g['Shop Category'] = g['MSKU'].map(last['Shop Category'])
+    g['unit_share'] = g['units'] / g.groupby('Category')['units'].transform('sum')
+    g['revenue_share'] = g['revenue'] / g.groupby('Category')['revenue'].transform('sum')
+    g['last3_units'] = g['MSKU'].map(h[h['Month'].isin(months[-3:])].groupby('MSKU')['units_sold'].sum()).fillna(0)
+    return g.fillna(0)
 
 
 def _resolve_category(category=None, product=None):
-    """
-    Category/product filter resolution: if a product is given, look up its
-    parent category (a product forecast is always derived from its category's
-    model -- see module docstring on top-down allocation).
-    Returns (category, product_share) where product_share is None if no
-    product filter was given.
-    """
+    """Returns (category, product_row_or_None). `product` may be a product name or an MSKU."""
     if category is None and product is None:
         raise ValueError("Provide either `category` or `product`.")
-
     if product is not None:
-        match = _product_share[_product_share['Product Name'] == product]
+        sh = _product_shares()
+        match = sh[(sh['Product Name'] == product) | (sh['MSKU'] == str(product))]
         if match.empty:
-            raise ValueError(f"Unknown product '{product}'.")
-        resolved_category = match['Category'].iloc[0]
-        if category is not None and category != resolved_category:
-            raise ValueError(f"Product '{product}' belongs to category "
-                              f"'{resolved_category}', not '{category}'.")
-        share = float(match['share'].iloc[0])
-        return resolved_category, share
-
-    return category, None
+            raise ValueError(f"Unknown or inactive product '{product}'.")
+        row = match.iloc[0]
+        if category is not None and str(category).upper() != row['Category']:
+            raise ValueError(f"Product '{product}' belongs to '{row['Category']}', not '{category}'.")
+        return row['Category'], row
+    return str(category).upper(), None
 
 
 def _monthly_series(category, target_col='units_sold'):
@@ -222,10 +246,17 @@ def get_forecast(category=None, product=None, horizon=1):
           'predicted_units': float, 'units_confidence_low': float, 'units_confidence_high': float,
           'predicted_revenue': float, 'revenue_confidence_low': float, 'revenue_confidence_high': float}, ...]
     """
-    cat, product_share = _resolve_category(category, product)
+    if product is None and category is not None:
+        kind, val = ca.resolve_filter(category)
+        if kind != 'model':                       # shop label or shop group -> sum of its products' forecasts
+            return _aggregate_forecast(kind, val, horizon)
+        category = val
+    cat, prow = _resolve_category(category, product)
     if cat not in CATEGORY_CODE_MAP:
         raise ValueError(f"Unknown category '{cat}'. Valid: {list(CATEGORY_CODE_MAP)}")
     cat_code = CATEGORY_CODE_MAP[cat]
+    product_share = None if prow is None else float(prow['unit_share'])
+    rev_share = None if prow is None else float(prow['revenue_share'])
 
     demand_series = _monthly_series(cat)[['Month', 'units_sold']].copy()
     revenue_series = _monthly_series(cat)[['Month', 'revenue', 'avg_price']].copy()
@@ -259,16 +290,16 @@ def get_forecast(category=None, product=None, horizon=1):
             'revenue_confidence_high': round(revenue_pred + r_band, 2),
         }
 
-        if product_share is not None:
+        if prow is not None:
             row = {
                 'month': row['month'],
                 'predicted_units': round(units_pred * product_share, 1),
                 'units_confidence_low': round(max((units_pred - d_band) * product_share, 0), 1),
                 'units_confidence_high': round((units_pred + d_band) * product_share, 1),
-                'predicted_revenue': round(revenue_pred * product_share, 2),
-                'revenue_confidence_low': round(max((revenue_pred - r_band) * product_share, 0), 2),
-                'revenue_confidence_high': round((revenue_pred + r_band) * product_share, 2),
-                'note': f"derived from '{cat}' category forecast x {product_share:.1%} historical product share",
+                'predicted_revenue': round(revenue_pred * rev_share, 2),
+                'revenue_confidence_low': round(max((revenue_pred - r_band) * rev_share, 0), 2),
+                'revenue_confidence_high': round((revenue_pred + r_band) * rev_share, 2),
+                'note': f"'{cat}' forecast x {product_share:.1%} unit share / {rev_share:.1%} revenue share (last 12 months)",
             }
 
         results.append(row)
@@ -285,45 +316,27 @@ def get_forecast(category=None, product=None, horizon=1):
 
 def get_historical_actuals(category=None, product=None, start_date=None, end_date=None):
     """
-    Return REAL historical monthly sales (units + revenue) for a category or
-    a specific product, between two dates. Read-only -- does NOT touch either
-    model. Safe to expose directly as a dashboard category/product + date
-    filter (see the "is historical-range filtering advisable" discussion --
-    this is the safe version of that idea: it filters DISPLAY, not training).
-
-    category / product: filter by one or the other (product implies its category)
-    start_date, end_date: 'YYYY-MM-DD' strings or pd.Timestamp; default to
-                           full available range if omitted
-    Returns: DataFrame with columns ['month', 'actual_units', 'actual_revenue']
+    REAL historical monthly sales (units + revenue) for a shop label / shop group / model category, or one product
+    (name or MSKU). Read-only -- never touches the models. Filters DISPLAY, not training.
+    Returns: DataFrame ['month', 'actual_units', 'actual_revenue']
     """
-    cat, product_share = _resolve_category(category, product)
-    if cat not in CATEGORY_CODE_MAP:
-        raise ValueError(f"Unknown category '{cat}'. Valid: {list(CATEGORY_CODE_MAP)}")
-
-    series = _monthly_series(cat)
+    h = _history()
+    if product is not None:
+        h = h[(h['Product Name'] == product) | (h['MSKU'] == str(product))]
+        if h.empty:
+            raise ValueError(f"Unknown product '{product}'.")
+    elif category is not None:
+        kind, val = ca.resolve_filter(category)
+        col = {'label': 'Shop Category', 'group': 'Shop Group', 'model': 'Category'}[kind]
+        h = h[h[col] == val]
+    else:
+        raise ValueError("Provide either `category` or `product`.")
+    out = h.groupby('Month').agg(actual_units=('units_sold', 'sum'), actual_revenue=('revenue', 'sum')).reset_index()
+    out = out.rename(columns={'Month': 'month'})
     if start_date is not None:
-        start_p = pd.Period(pd.Timestamp(start_date), freq='M')
-        series = series[series['Month'] >= start_p]
+        out = out[out['month'] >= str(pd.Period(pd.Timestamp(start_date), freq='M'))]
     if end_date is not None:
-        end_p = pd.Period(pd.Timestamp(end_date), freq='M')
-        series = series[series['Month'] <= end_p]
-
-    out = series[['Month', 'units_sold', 'revenue']].rename(
-        columns={'Month': 'month', 'units_sold': 'actual_units', 'revenue': 'actual_revenue'})
-
-    if product_share is not None:
-        # NOTE: for a specific product, exact historical actuals ARE available
-        # (unlike the forecast, which must be allocated) -- use real transaction
-        # data directly rather than the category-share approximation
-        df = _load_transactions()
-        df['Month'] = df['POS Order Date'].dt.to_period('M')
-        prod_actual = df[df['Product Name'] == product].groupby('Month').agg(
-            actual_units=('Quantity', 'sum'), actual_revenue=('Total Sales VAT Inclusive', 'sum')
-        ).reset_index()
-        out = out[['month']].merge(prod_actual, left_on='month', right_on='Month', how='left').drop(columns='Month')
-        out[['actual_units', 'actual_revenue']] = out[['actual_units', 'actual_revenue']].fillna(0)
-
-    out['month'] = out['month'].astype(str)
+        out = out[out['month'] <= str(pd.Period(pd.Timestamp(end_date), freq='M'))]
     return out.reset_index(drop=True)
 
 
@@ -405,3 +418,182 @@ def flag_high_variance_categories(threshold=0.35, target='demand'):
     flagged = flagged.reset_index()
     flagged['relative_error_pct'] = (flagged['relative_error'] * 100).round(1)
     return flagged[['Category', 'mae', 'rmse', 'avg_actual', 'relative_error_pct']]
+
+
+# -----------------------------------------------------------------
+# Screen-level helpers (Product Demand Forecast / Sales-Revenue Forecast)
+# All category output uses the SHOP vocabulary (Client + Custodian labels, Client groups) -- see category_alignment.py
+# -----------------------------------------------------------------
+SKIP_CATEGORIES = {'ALL'}
+_BAND_COLS = ['u', 'u_lo', 'u_hi', 'r', 'r_lo', 'r_hi']        # mid, and distance mid->low / mid->high
+
+
+def _model_categories():
+    """Model categories that have history AND a trained code."""
+    return [c for c in _history()['Category'].unique() if c in CATEGORY_CODE_MAP and c.upper() not in SKIP_CATEGORIES]
+
+
+@functools.lru_cache(maxsize=8)
+def _product_forecast(horizon):
+    """One row per product x forecast month = model category forecast x the product's 12-month share
+    (unit share for units, revenue share for revenue). Band half-widths are kept so rows can be re-aggregated to any
+    level: bands add linearly inside one model category and in quadrature across different ones."""
+    shares = _product_shares()
+    rows = []
+    for mc in _model_categories():
+        prods = shares[shares['Category'] == mc].to_dict('records')
+        if not prods:
+            continue
+        for r in get_forecast(category=f'model:{mc}', horizon=horizon):
+            for p in prods:
+                us, rs = p['unit_share'], p['revenue_share']
+                rows.append({
+                    'month': r['month'], 'msku': p['MSKU'], 'product_name': p['Product Name'],
+                    'shop_group': p['Shop Group'], 'category': p['Shop Category'], 'model_category': mc,
+                    'u': r['predicted_units'] * us,
+                    'u_lo': (r['predicted_units'] - r['units_confidence_low']) * us,
+                    'u_hi': (r['units_confidence_high'] - r['predicted_units']) * us,
+                    'r': r['predicted_revenue'] * rs,
+                    'r_lo': (r['predicted_revenue'] - r['revenue_confidence_low']) * rs,
+                    'r_hi': (r['revenue_confidence_high'] - r['predicted_revenue']) * rs,
+                })
+    return pd.DataFrame(rows)
+
+
+def _filter(df, kind, val):
+    col = {'label': 'category', 'group': 'shop_group', 'model': 'model_category'}[kind]
+    return df[df[col] == val]
+
+
+def _rollup(df, keys):
+    """Sum product rows to `keys` (+ month). Linear within a model category, quadrature across model categories."""
+    lin = df.groupby(['month', 'model_category'] + keys)[_BAND_COLS].sum().reset_index()
+    for c in ['u_lo', 'u_hi', 'r_lo', 'r_hi']:
+        lin[c] = lin[c] ** 2
+    out = lin.groupby(['month'] + keys)[_BAND_COLS].sum().reset_index()
+    for c in ['u_lo', 'u_hi', 'r_lo', 'r_hi']:
+        out[c] = out[c] ** 0.5
+    return out
+
+
+def _fmt(row):
+    return {'predicted_units': round(row['u'], 1),
+            'units_confidence_low': round(max(row['u'] - row['u_lo'], 0), 1),
+            'units_confidence_high': round(row['u'] + row['u_hi'], 1),
+            'predicted_revenue': round(row['r'], 2),
+            'revenue_confidence_low': round(max(row['r'] - row['r_lo'], 0), 2),
+            'revenue_confidence_high': round(row['r'] + row['r_hi'], 2)}
+
+
+def _aggregate_forecast(kind, val, horizon):
+    """get_forecast() for a shop label or shop group: same shape as the model-category result."""
+    df = _filter(_product_forecast(horizon), kind, val)
+    if df.empty:
+        raise ValueError(f"No forecastable products with enough history in '{val}'.")
+    agg = _rollup(df, [])
+    return [{'month': r['month'], **_fmt(r)} for _, r in agg.sort_values('month').iterrows()]
+
+
+def get_categories():
+    """The canonical category list every role should use (feeds the Retail filters)."""
+    h = _history()
+    active = set(h['Shop Category'])
+    tax = ca.taxonomy()
+    return {
+        'source': 'Client/Custodian taxonomy (includes/client_shop_taxonomy.php)',
+        'groups': [{'group': g, 'categories': [{'category': lab, 'has_forecast_history': lab in active}
+                                               for lab in labs]} for g, labs in tax['groups'].items()],
+        'model_categories_internal': sorted(_model_categories()),
+    }
+
+
+def get_revenue_forecast(horizon=3, category=None):
+    """Sales/Revenue screen. `category` may be a shop label, shop group, or 'model:X'. Returns the total for the
+    selection, a breakdown by shop category and by shop group, and the monthly history for the chart."""
+    df = _product_forecast(horizon)
+    h = _history()
+    if category:
+        kind, val = ca.resolve_filter(category)
+        df = _filter(df, kind, val)
+        h = _filter(h.rename(columns={'Shop Category': 'category', 'Shop Group': 'shop_group', 'Category': 'model_category'}),
+                    kind, val)
+    else:
+        h = h.rename(columns={'Shop Category': 'category', 'Shop Group': 'shop_group', 'Category': 'model_category'})
+    if df.empty:                                  # valid category, but nothing to forecast: answer 200 with an empty state
+        hist = h.groupby('Month').agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')).reset_index() \
+            .rename(columns={'Month': 'month'})
+        return {'filter': {'kind': kind, 'value': val} if category else None, 'total': [], 'by_category': [],
+                'by_group': [], 'history': hist.round(2).to_dict('records'), 'history_by_category': [],
+                'message': "No forecast is available for this category yet (it has no trained model category, or no product in it sold in the last 6 months)."}
+    total = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()]
+    by_cat = [{'category': r['category'], 'group': ca.group_of(r['category']), 'month': r['month'], **_fmt(r)}
+              for _, r in _rollup(df, ['category']).sort_values(['category', 'month']).iterrows()]
+    by_grp = [{'group': r['shop_group'], 'month': r['month'], **_fmt(r)}
+              for _, r in _rollup(df, ['shop_group']).sort_values(['shop_group', 'month']).iterrows()]
+    hist = h.groupby('Month').agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')).reset_index()
+    hist = hist.rename(columns={'Month': 'month'})
+    hist_cat = h.groupby(['Month', 'category']).agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')) \
+        .reset_index().rename(columns={'Month': 'month'})
+    return {'filter': {'kind': kind, 'value': val} if category else None, 'total': total, 'by_category': by_cat,
+            'by_group': by_grp, 'history': hist.round(2).to_dict('records'),
+            'history_by_category': hist_cat.round(2).to_dict('records')}
+
+
+def get_product_demand(horizon=3, category=None, top=50):
+    """Product Demand screen: per-product forecast with product NAME, MSKU, shop category/group, last-3-month units,
+    forecast units + range, forecast revenue, trend and a data-quality / reliability flag."""
+    df = _product_forecast(horizon)
+    if category:
+        kind, val = ca.resolve_filter(category)
+        df = _filter(df, kind, val)
+    sh = _product_shares().set_index('MSKU')
+    g = df.groupby('msku').agg(product_name=('product_name', 'first'), category=('category', 'first'),
+                               group=('shop_group', 'first'), model_category=('model_category', 'first'),
+                               u=('u', 'sum'), u_lo=('u_lo', 'sum'), u_hi=('u_hi', 'sum'), r=('r', 'sum')).reset_index()
+    rel = {mc: get_forecast_confidence(mc, 'demand')['reliability'] for mc in g['model_category'].unique()}
+    rows = []
+    for p in g.itertuples(index=False):
+        last3 = float(sh.loc[p.msku, 'last3_units']); active = int(sh.loc[p.msku, 'months_active'])
+        rows.append({
+            'msku': p.msku, 'product_name': p.product_name, 'category': p.category, 'group': p.group,
+            'model_category': p.model_category,
+            'last_3m_units': int(last3), 'forecast_units': round(p.u, 1),
+            'forecast_units_low': round(max(p.u - p.u_lo, 0), 1), 'forecast_units_high': round(p.u + p.u_hi, 1),
+            'forecast_revenue': round(p.r, 2),
+            'trend_pct': round((p.u / horizon * 3 / last3 - 1) * 100, 1) if last3 > 0 else None,
+            'months_active_12m': active,
+            'confidence': 'low (thin history)' if active < 6 else 'category-based',
+            'model_reliability': rel.get(p.model_category, 'unknown'),
+        })
+    rows.sort(key=lambda r: r['forecast_units'], reverse=True)
+    out = {'horizon_months': horizon, 'filter': {'kind': kind, 'value': val} if category else None,
+            'products': rows[:int(top)], 'total_products': len(rows)}
+    if not rows:
+        out['message'] = "No forecast is available for this category yet (it has no trained model category, or no product in it sold in the last 6 months)."
+    return out
+
+
+@functools.lru_cache(maxsize=1)
+def get_model_metrics():
+    """Held-out accuracy vs naive baselines, from the prediction logs written by rebuild_models_v2.py."""
+    feats = pd.read_csv(BASE_DIR / 'preprocessed_monthly_features.csv')
+    skip = {'All', 'CUSTOMIZATION'}
+    out = {}
+    for target, fname, lag in [('demand', 'monthly_predictions.csv', 'lag_1'),
+                               ('revenue', 'revenue_predictions.csv', 'revenue_lag_1')]:
+        p = pd.read_csv(BASE_DIR / fname)
+        m = p.merge(feats[['Month', 'Category', lag]], on=['Month', 'Category'])
+        m = m[~m['Category'].isin(skip)]
+        a = m['actual'].abs().sum()
+        err = m['actual'] - m['predicted']
+        out[target] = {
+            'test_months': sorted(m['Month'].unique().tolist()),
+            'wape_pct': round(float(err.abs().sum() / a * 100), 1),
+            'naive_last_month_wape_pct': round(float((m['actual'] - m[lag]).abs().sum() / a * 100), 1),
+            'mae': round(float(err.abs().mean()), 2), 'rmse': round(float((err ** 2).mean() ** 0.5), 2),
+            'bias_pct': round(float((m['predicted'].sum() / m['actual'].sum() - 1) * 100), 1),
+        }
+    h = _history()
+    out['data'] = {'first_month': h['Month'].min(), 'last_month': h['Month'].max(),
+                   'products': int(h['MSKU'].nunique()), 'rows': int(len(h))}
+    return out

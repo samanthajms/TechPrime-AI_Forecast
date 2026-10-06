@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: techprime-forecast
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn forecast_service:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: FORECAST_API_KEY
+        sync: false        # set in the Render dashboard (new long random value)
