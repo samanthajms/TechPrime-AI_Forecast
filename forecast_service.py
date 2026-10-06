@@ -72,6 +72,9 @@ def reload_data():
     forecast.reload_history()
     return {"status": "reloaded"}
 
+@app.route("/api/categories")
+def categories():
+    return _safe(forecast.get_categories)
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5001, debug=False)
