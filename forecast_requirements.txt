@@ -1,6 +1,0 @@
-flask
-python-dotenv
-xgboost
-pandas
-numpy
-psycopg2-binary
