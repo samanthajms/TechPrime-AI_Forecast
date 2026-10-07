@@ -11,3 +11,5 @@ services:
         value: 3.12.7
       - key: FORECAST_API_KEY
         sync: false        # set in the Render dashboard (new long random value)
+      - key: FORECAST_ADMIN_KEY
+        sync: false        # separate secret for POST /api/reload (omit it and reload is disabled)

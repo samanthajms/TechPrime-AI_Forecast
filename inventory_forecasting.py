@@ -69,17 +69,39 @@ REVENUE_FEATURES = ['revenue_lag_1', 'revenue_lag_12', 'revenue_roll_mean_3', 'r
 # -----------------------------------------------------------------
 # Load models + supporting artifacts once at import time
 # -----------------------------------------------------------------
-_demand_model = xgb.XGBRegressor()
-_demand_model.load_model(str(DEMAND_MODEL_PATH))
+MAX_HORIZON = 3   # product requirement: forecasts are limited to 1-3 months ahead
 
-_revenue_model = xgb.XGBRegressor()
-_revenue_model.load_model(str(REVENUE_MODEL_PATH))
 
-with open(CATEGORY_MAP_PATH) as f:
-    CATEGORY_CODE_MAP = json.load(f)
+def check_horizon(horizon):
+    """Single source of truth for the 1..MAX_HORIZON month window (the service and every public forecast entry point call it)."""
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= MAX_HORIZON:
+        raise ValueError(f"horizon must be a whole number of months from 1 to {MAX_HORIZON}")
+    return horizon
 
-_cat_confidence = pd.read_csv(CATEGORY_CONFIDENCE_PATH).set_index('Category')
-_revenue_confidence = pd.read_csv(REVENUE_CONFIDENCE_PATH).set_index('Category')
+
+_demand_model = _revenue_model = None
+CATEGORY_CODE_MAP = {}
+_cat_confidence = _revenue_confidence = None
+
+
+def reload_models():
+    """(Re)load the trained models, category codes and confidence tables from disk. Called at import and again after a
+    monthly retrain so the running process picks up the new artifacts without a restart. Everything is loaded first and
+    swapped in together, so a half-written file can never leave the module in a mixed state."""
+    global _demand_model, _revenue_model, CATEGORY_CODE_MAP, _cat_confidence, _revenue_confidence
+    demand = xgb.XGBRegressor()
+    demand.load_model(str(DEMAND_MODEL_PATH))
+    revenue = xgb.XGBRegressor()
+    revenue.load_model(str(REVENUE_MODEL_PATH))
+    with open(CATEGORY_MAP_PATH) as f:
+        code_map = json.load(f)
+    cat_conf = pd.read_csv(CATEGORY_CONFIDENCE_PATH).set_index('Category')
+    rev_conf = pd.read_csv(REVENUE_CONFIDENCE_PATH).set_index('Category')
+    _demand_model, _revenue_model, CATEGORY_CODE_MAP = demand, revenue, code_map
+    _cat_confidence, _revenue_confidence = cat_conf, rev_conf
+
+
+reload_models()
 
 
 # -----------------------------------------------------------------
@@ -100,7 +122,10 @@ def _history():
 
 
 def reload_history():
-    _history.cache_clear(); _product_shares.cache_clear(); _product_forecast.cache_clear(); ca.reload_map()
+    """Reload the models and history after a retrain / data refresh and drop every cache that depends on them."""
+    reload_models()
+    _history.cache_clear(); _product_shares.cache_clear(); _product_forecast.cache_clear()
+    get_model_metrics.cache_clear(); ca.reload_map()
 
 
 def _load_transactions():
@@ -246,6 +271,7 @@ def get_forecast(category=None, product=None, horizon=1):
           'predicted_units': float, 'units_confidence_low': float, 'units_confidence_high': float,
           'predicted_revenue': float, 'revenue_confidence_low': float, 'revenue_confidence_high': float}, ...]
     """
+    check_horizon(horizon)
     if product is None and category is not None:
         kind, val = ca.resolve_filter(category)
         if kind != 'model':                       # shop label or shop group -> sum of its products' forecasts
@@ -510,6 +536,7 @@ def get_categories():
 def get_revenue_forecast(horizon=3, category=None):
     """Sales/Revenue screen. `category` may be a shop label, shop group, or 'model:X'. Returns the total for the
     selection, a breakdown by shop category and by shop group, and the monthly history for the chart."""
+    check_horizon(horizon)
     df = _product_forecast(horizon)
     h = _history()
     if category:
@@ -542,6 +569,7 @@ def get_revenue_forecast(horizon=3, category=None):
 def get_product_demand(horizon=3, category=None, top=50):
     """Product Demand screen: per-product forecast with product NAME, MSKU, shop category/group, last-3-month units,
     forecast units + range, forecast revenue, trend and a data-quality / reliability flag."""
+    check_horizon(horizon)
     df = _product_forecast(horizon)
     if category:
         kind, val = ca.resolve_filter(category)

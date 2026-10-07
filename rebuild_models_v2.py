@@ -49,6 +49,8 @@ USAGE:
 
 import argparse
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -97,22 +99,27 @@ def _chronological_split(df, train_fraction=TRAIN_FRACTION):
     return train_df, test_df, train_months, test_months
 
 
-def _train_one_model(train_df, test_df, features, target_col):
-    X_train, y_train = train_df[features], train_df[target_col]
-    X_test, y_test = test_df[features], test_df[target_col]
+VAL_MONTHS = 3  # most recent TRAIN months held out for early stopping (never the 20% test months)
 
-    model = xgb.XGBRegressor(
-        n_estimators=200,
-        max_depth=3,
-        learning_rate=0.1,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        objective='reg:squarederror',
-        random_state=42,
-        early_stopping_rounds=15,
-        eval_metric='rmse',
-    )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+
+def _train_one_model(train_df, test_df, features, target_col):
+    """Fit on the 80% train months only. Early stopping picks the number of trees using the last VAL_MONTHS train
+    months, then the model is refit on the full 80% with that tree count. The 20% test months are never seen
+    during fitting or tuning, so the reported test error is an honest out-of-sample number."""
+    params = dict(max_depth=3, learning_rate=0.1, subsample=0.9, colsample_bytree=0.9,
+                  objective='reg:squarederror', random_state=42)
+
+    months = sorted(train_df['Month'].unique())
+    n_val = min(VAL_MONTHS, max(1, len(months) // 5))
+    fit_df = train_df[train_df['Month'].isin(months[:-n_val])]
+    val_df = train_df[train_df['Month'].isin(months[-n_val:])]
+
+    probe = xgb.XGBRegressor(n_estimators=200, early_stopping_rounds=15, eval_metric='rmse', **params)
+    probe.fit(fit_df[features], fit_df[target_col], eval_set=[(val_df[features], val_df[target_col])], verbose=False)
+    best_n = int(probe.best_iteration) + 1
+
+    model = xgb.XGBRegressor(n_estimators=best_n, **params)
+    model.fit(train_df[features], train_df[target_col], verbose=False)
     return model
 
 
@@ -155,12 +162,50 @@ def _gate_report(confidence, target_name, threshold):
     return overall_relative_error, failing
 
 
+ARTIFACTS = [DEMAND_MODEL_PATH, REVENUE_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, REVENUE_CONFIDENCE_PATH,
+             MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH]
+
+
+def _overall_rel_error(conf_df):
+    mean_actual = conf_df['avg_actual'].replace(0, np.nan).mean()
+    return float(conf_df['rmse'].mean() / mean_actual)
+
+
+def _passes_regression_gate(demand_confidence, revenue_confidence):
+    """New models must not be worse than the deployed ones (compared on each model's own held-out relative error)."""
+    ok = True
+    for name, new_conf, path in [('demand', demand_confidence, CATEGORY_CONFIDENCE_PATH),
+                                 ('revenue', revenue_confidence, REVENUE_CONFIDENCE_PATH)]:
+        if not path.exists():
+            continue
+        old, new = _overall_rel_error(pd.read_csv(path).set_index('Category')), _overall_rel_error(new_conf)
+        print(f"Gate [{name}]: deployed {old:.1%} -> new {new:.1%}")
+        if not np.isfinite(new) or (np.isfinite(old) and new > old):
+            ok = False
+    return ok
+
+
+def _backup_artifacts():
+    """Copy the current artifacts to artifacts_backup/<timestamp>/ so a bad retrain can be rolled back."""
+    existing = [p for p in ARTIFACTS if p.exists()]
+    if not existing:
+        return None
+    dest = BASE_DIR / 'artifacts_backup' / datetime.now().strftime('%Y%m%d_%H%M%S')
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in existing:
+        shutil.copy2(p, dest / p.name)
+    return dest
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--gate-threshold', type=float, default=0.35,
                          help="Relative-error (RMSE/avg_actual) threshold above which a "
                               "category is flagged as unreliable. Default 0.35, matching "
                               "flag_high_variance_categories()'s default in inventory_forecasting.py.")
+    parser.add_argument('--enforce-gate', action='store_true',
+                         help="Do not overwrite the live artifacts if the new models' overall relative error "
+                              "is worse than the currently deployed models' (backups are always taken).")
     parser.add_argument('--train-fraction', type=float, default=TRAIN_FRACTION,
                          help="Chronological train fraction. Default 0.8 (80/20).")
     args = parser.parse_args()
@@ -182,6 +227,14 @@ def main():
     revenue_model = _train_one_model(train_df, test_df, REVENUE_FEATURES, 'revenue')
     revenue_preds = np.clip(revenue_model.predict(test_df[REVENUE_FEATURES]), 0, None)
     revenue_log, revenue_confidence = _per_category_confidence(test_df, revenue_preds, 'revenue')
+
+    # ---------------- Promotion gate + backup ----------------
+    if args.enforce_gate and not _passes_regression_gate(demand_confidence, revenue_confidence):
+        print("\nGATE FAILED: new models are worse than the deployed ones. Nothing was overwritten.")
+        raise SystemExit(2)
+    backup_dir = _backup_artifacts()
+    if backup_dir:
+        print(f"Previous artifacts backed up to {backup_dir.name}/")
 
     # ---------------- Persist artifacts ----------------
     demand_model.save_model(str(DEMAND_MODEL_PATH))

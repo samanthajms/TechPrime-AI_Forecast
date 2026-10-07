@@ -2,3 +2,4 @@ testing.env
 .env
 __pycache__/
 *.pyc
+artifacts_backup/
