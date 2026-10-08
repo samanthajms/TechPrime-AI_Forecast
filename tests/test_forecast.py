@@ -68,6 +68,21 @@ class Service(unittest.TestCase):
             r = self.c.get(f"/api/forecast/revenue?horizon={h}", headers=self.h)
             self.assertEqual(r.status_code, code, h)
 
+    def test_date_range_filters_history_not_forecast(self):
+        full = self.c.get("/api/forecast/revenue?horizon=2", headers=self.h).get_json()
+        part = self.c.get("/api/forecast/revenue?horizon=2&from=2026-06-01&to=2026-08-31", headers=self.h).get_json()
+        self.assertEqual([r["month"] for r in part["history"]], ["2026-06", "2026-07", "2026-08"])
+        self.assertGreater(len(full["history"]), 3)
+        self.assertEqual(full["total"], part["total"])               # forecast untouched
+        d = self.c.get("/api/forecast/demand?horizon=1&top=3&from=2026-06&to=2026-08", headers=self.h).get_json()
+        self.assertIn("range_units", d["products"][0])
+        self.assertEqual(d["range"], {"from": "2026-06", "to": "2026-08"})
+
+    def test_bad_date_range_rejected(self):
+        for q in ("from=nope", "from=2026-08&to=2026-01"):
+            r = self.c.get(f"/api/forecast/revenue?horizon=1&{q}", headers=self.h)
+            self.assertEqual(r.status_code, 400, q)
+
     def test_security_headers_and_json_404(self):
         r = self.c.get("/api/nope", headers=self.h)
         self.assertEqual(r.status_code, 404)

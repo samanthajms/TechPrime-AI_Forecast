@@ -6,6 +6,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
+import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -140,6 +141,24 @@ def _top(default=50):
     return max(1, min(_int_arg("top", default), 300))
 
 
+def _month_arg(name):
+    """Optional ?from= / ?to= as YYYY-MM or YYYY-MM-DD -> 'YYYY-MM' (or None)."""
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return str(pd.Period(raw[:7], freq="M"))
+    except Exception:  # noqa: BLE001
+        raise BadRequest(f"{name} must be a date like 2026-01 or 2026-01-31") from None
+
+
+def _range():
+    start, end = _month_arg("from"), _month_arg("to")
+    if start and end and start > end:
+        raise BadRequest("from must not be after to")
+    return start, end
+
+
 def _category():
     c = (request.args.get("category") or "").strip()
     if len(c) > 80:
@@ -165,12 +184,13 @@ def health():
 @app.route("/api/forecast/demand")            # Product Demand Forecast screen
 def demand():
     return _safe(lambda: forecast.get_product_demand(
-        horizon=_horizon(), category=_category(), top=_top()))
+        horizon=_horizon(), category=_category(), top=_top(), start=_range()[0], end=_range()[1]))
 
 
 @app.route("/api/forecast/revenue")           # Sales / Revenue Forecast screen
 def revenue():
-    return _safe(lambda: forecast.get_revenue_forecast(horizon=_horizon(), category=_category()))
+    return _safe(lambda: forecast.get_revenue_forecast(
+        horizon=_horizon(), category=_category(), start=_range()[0], end=_range()[1]))
 
 
 @app.route("/api/forecast")                   # backward compatible with the existing forecast_api.php
