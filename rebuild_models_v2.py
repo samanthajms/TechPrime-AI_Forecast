@@ -25,9 +25,9 @@ WHAT THIS SCRIPT DOES:
   - Splits chronologically: first 80% of available months = train,
     most recent 20% = test. The split is by MONTH, not by row, so no
     category's test rows are ever chronologically earlier than its train rows.
-  - Trains both models fresh (early stopping against the held-out 20%,
-    matching how the shipped models were trained -- see best_iteration in
-    the model JSON)
+  - Trains both models fresh on the 80% train months. Early stopping uses
+    only the last few TRAIN months, so the 20% test months are never used
+    for fitting or tuning and the reported test error is out-of-sample
   - Writes/overwrites:
       xgb_monthly_demand_model.json, xgb_monthly_revenue_model.json
       category_confidence.csv, revenue_category_confidence.csv   (per-category
@@ -37,14 +37,17 @@ WHAT THIS SCRIPT DOES:
           per-month actual vs. predicted over the held-out 20% -- feeds
           compare_actual_vs_forecast() as a demo log; replace with a real
           forecast_log table in production, per that function's docstring)
+  - Regression gate (ON by default): if the new models' overall held-out
+    relative error is worse than the deployed models', NOTHING is overwritten
+    and the script exits with status 2 (so a scheduled job fails loudly).
+    Pass --no-enforce-gate to override.
   - Prints a PRE-DEPLOYMENT GATE report: overall + per-category relative
-    error, and which categories fail the reliability threshold. This does
-    NOT auto-block deployment (no CI/CD hook here) -- a human reads this
-    report and decides whether to promote the new model files.
+    error, and which categories fail the reliability threshold (informational).
 
 USAGE:
     python rebuild_models_v2.py
     python rebuild_models_v2.py --gate-threshold 0.35
+    python rebuild_models_v2.py --no-enforce-gate
 """
 
 import argparse
@@ -203,9 +206,10 @@ def main():
                          help="Relative-error (RMSE/avg_actual) threshold above which a "
                               "category is flagged as unreliable. Default 0.35, matching "
                               "flag_high_variance_categories()'s default in inventory_forecasting.py.")
-    parser.add_argument('--enforce-gate', action='store_true',
-                         help="Do not overwrite the live artifacts if the new models' overall relative error "
-                              "is worse than the currently deployed models' (backups are always taken).")
+    parser.add_argument('--enforce-gate', action=argparse.BooleanOptionalAction, default=True,
+                         help="(default on) Do not overwrite the live artifacts if the new models' overall relative "
+                              "error is worse than the currently deployed models'. --no-enforce-gate to override. "
+                              "Backups are always taken before an overwrite.")
     parser.add_argument('--train-fraction', type=float, default=TRAIN_FRACTION,
                          help="Chronological train fraction. Default 0.8 (80/20).")
     args = parser.parse_args()
@@ -258,10 +262,9 @@ def main():
     _gate_report(demand_confidence, 'demand', args.gate_threshold)
     _gate_report(revenue_confidence, 'revenue', args.gate_threshold)
 
-    print("\nNOTE: this report is informational only -- it does not block the file "
-          "overwrite above. If any category fails the gate, decide manually whether "
-          "to keep the previous model files (git/back up before rerunning) or accept "
-          "the retrain and route that category to flag_high_variance_categories() review.")
+    print("\nNOTE: the per-category report above is informational. Only the overall regression gate "
+          "(--enforce-gate, on by default) blocks an overwrite. If a category fails its threshold, "
+          "route it to flag_high_variance_categories() review.")
     print("\nReminder: this gate is a pre-deployment check on held-out history. It is "
           "NOT the long-run scoreboard -- keep using compare_actual_vs_forecast() every "
           "month once real actuals come in, independent of when this script last ran.")

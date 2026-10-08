@@ -51,11 +51,16 @@ CHECKS = [
     ("Does order_items.order_id actually match any orders.id",
      "SELECT COUNT(*) FROM order_items oi JOIN orders o ON o.id = oi.order_id;"),
 
-    ("Sample of 5 raw order_items rows (to see real column values)",
-     "SELECT * FROM order_items LIMIT 5;"),
+    # Column names only -- never print raw rows: order data can contain customer details.
+    ("order_items columns",
+     "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='order_items' ORDER BY ordinal_position;"),
+
+    ("Distinct order statuses (and how many orders each)",
+     "SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY 2 DESC;"),
 ]
 
 with psycopg2.connect(**DB_CONFIG) as conn:
+    conn.set_session(readonly=True)
     with conn.cursor() as cur:
         for label, sql in CHECKS:
             print(f"\n--- {label} ---")

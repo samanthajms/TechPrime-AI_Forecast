@@ -2,14 +2,24 @@ services:
   - type: web
     name: techprime-forecast
     runtime: python
-    plan: free
+    plan: free                # recommended: starter or higher (no cold starts, always-on health checks)
+    autoDeploy: true          # merging the monthly retrain PR redeploys the service with the new models
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn forecast_service:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    # One worker + threads: the in-process rate limiter and the model reload are per worker (see docs/RENDER_SECURITY_GUIDE.md)
+    startCommand: gunicorn forecast_service:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120 --limit-request-line 4094 --limit-request-field_size 8190
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
       - key: FORECAST_API_KEY
-        sync: false        # set in the Render dashboard (new long random value)
+        sync: false        # set in the Render dashboard (long random value; same value goes in the PHP service)
       - key: FORECAST_ADMIN_KEY
         sync: false        # separate secret for POST /api/reload (omit it and reload is disabled)
+      - key: RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: AUTH_FAIL_LIMIT
+        value: "10"
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      # - key: HISTORY_CUTOFF   # demo only: e.g. 2026-05 forecasts Jun-Aug as if May were the latest month
+      #   value: "2026-05"
