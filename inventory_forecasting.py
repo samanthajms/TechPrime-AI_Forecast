@@ -107,11 +107,29 @@ reload_models()
 # -----------------------------------------------------------------
 # Internal: data access layer -- REPLACE THIS FOR PRODUCTION
 # -----------------------------------------------------------------
+def history_cutoff():
+    """Optional HISTORY_CUTOFF=YYYY-MM. When set, every forecast treats that month as the latest actual month, so the
+    forecast window can be moved back to demonstrate output against months whose real sales are already known.
+    Needs reload_history() (or a restart) to take effect on a running process."""
+    raw = os.environ.get('HISTORY_CUTOFF', '').strip()
+    if not raw:
+        return None
+    try:
+        return str(pd.Period(raw, freq='M'))
+    except Exception:  # noqa: BLE001
+        raise ValueError("HISTORY_CUTOFF must look like YYYY-MM (e.g. 2026-05).") from None
+
+
 @functools.lru_cache(maxsize=1)
 def _history():
     """Monthly PRODUCT history (with product names). Written by build_product_history.py (legacy POS)
     or by the live-DB rebuild job -- same columns either way."""
     h = pd.read_csv(HISTORY_PATH, dtype={'MSKU': str})
+    cutoff = history_cutoff()
+    if cutoff:                                                     # demo / back-test: forecast as if `cutoff` were the latest month
+        h = h[h['Month'] <= cutoff]
+        if h.empty:
+            raise ValueError(f"HISTORY_CUTOFF {cutoff} is before the first month in the history file.")
     h['Category'] = h['Category'].str.strip().str.upper()          # MODEL category (what the models are trained on)
     if 'Shop Category' not in h.columns:                           # older file without shop columns -> derive
         cls = {m: ca.classify_product(m, n, c) for m, n, c in
@@ -622,6 +640,6 @@ def get_model_metrics():
             'bias_pct': round(float((m['predicted'].sum() / m['actual'].sum() - 1) * 100), 1),
         }
     h = _history()
-    out['data'] = {'first_month': h['Month'].min(), 'last_month': h['Month'].max(),
+    out['data'] = {'first_month': h['Month'].min(), 'last_month': h['Month'].max(), 'history_cutoff': history_cutoff(),
                    'products': int(h['MSKU'].nunique()), 'rows': int(len(h))}
     return out

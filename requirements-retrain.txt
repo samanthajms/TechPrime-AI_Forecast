@@ -1,0 +1,4 @@
+# Monthly retrain job (GitHub Actions / local). Not installed on the Render web service.
+-r requirements.txt
+psycopg2-binary==2.9.*
+openpyxl==3.1.*

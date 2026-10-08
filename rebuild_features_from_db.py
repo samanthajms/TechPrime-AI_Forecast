@@ -44,9 +44,21 @@ WHEN TO RUN THIS:
   month that just ended. Then run rebuild_models_v2.py right after, to
   retrain the models on the refreshed data.
 
+WHAT COUNTS AS A SALE (so a spam or cancelled order cannot skew the forecast):
+  - online orders whose status is in COUNTED_ORDER_STATUSES (not cancelled / unpaid),
+  - cashier POS sales with status 'completed' (walk-in sales; voided ones are ignored),
+  - CLOSED calendar months only (Asia/Manila) -- a half-finished month is never fed to the model.
+
+It ALSO tops up preprocessed_monthly_product_features.csv (the per-product history the running service reads for
+inference), so both history files always end on the same month.
+
+The connection is opened READ ONLY; give it a database user that can only SELECT orders, order_items, products,
+pos_sales and pos_sale_items.
+
 USAGE:
     python rebuild_features_from_db.py
-    python rebuild_features_from_db.py --dry-run     # preview only, don't overwrite anything
+    python rebuild_features_from_db.py --dry-run               # preview only, don't overwrite anything
+    python rebuild_features_from_db.py --allow-new-categories  # let unseen product categories get a new model code
 """
 
 import argparse
@@ -63,6 +75,7 @@ BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / '.env')
 
 FEATURES_PATH = BASE_DIR / 'preprocessed_monthly_features.csv'
+PRODUCT_HISTORY_PATH = BASE_DIR / 'preprocessed_monthly_product_features.csv'
 CATEGORY_MAP_PATH = BASE_DIR / 'category_code_map.json'
 
 DB_CONFIG = {
@@ -73,6 +86,15 @@ DB_CONFIG = {
     'password': os.environ.get('DB_PASS'),
     'sslmode': 'require',
 }
+
+# Online-order statuses that count as real demand (see ias_order_display_status in the PHP app). Everything else --
+# 'Pending', 'to_pay' (unpaid), 'cancelled', anything unknown -- is left out on purpose.
+COUNTED_ORDER_STATUSES = ('to_ship', 'to_receive', 'delivered', 'completed')
+
+# Calendar month in Asia/Manila. created_at columns are timestamp-without-tz holding UTC.
+_ORDER_MONTH = "date_trunc('month', (o.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date"
+_POS_MONTH = "date_trunc('month', (s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date"
+_THIS_MONTH_START = "date_trunc('month', now() AT TIME ZONE 'Asia/Manila')::date"
 
 # Column order must match the existing CSV exactly -- rebuild_models_v2.py
 # and inventory_forecasting.py both expect these names.
@@ -103,36 +125,89 @@ def load_existing_base() -> pd.DataFrame:
 # -----------------------------------------------------------------
 # Step 1b: pull real transactions, grouped by month + category
 # -----------------------------------------------------------------
-def fetch_monthly_sales() -> pd.DataFrame:
-    """
-    One row per (month, category) with total units and total revenue.
-    Mirrors the same order_items/products/orders join the PHP dashboards
-    already use (ias_fetch_all_sales_rows in includes/retail_reports.php),
-    so these numbers will match what Admin/Retail already see -- no status
-    filter is applied here for the same reason.
-    """
-    query = """
-        SELECT
-            date_trunc('month', o.created_at)::date AS month,
-            UPPER(TRIM(p.category)) AS category,
-            SUM(oi.quantity)::float AS units_sold,
-            SUM(oi.price * oi.quantity)::float AS revenue
-        FROM order_items oi
-        JOIN products p ON p.id = oi.product_id
-        JOIN orders o ON o.id = oi.order_id
-        WHERE p.category IS NOT NULL AND p.category <> ''
-        GROUP BY 1, 2
-        ORDER BY 2, 1
-    """
+def _read_sql(query: str, params: tuple = ()) -> pd.DataFrame:
     with psycopg2.connect(**DB_CONFIG) as conn:
-        df = pd.read_sql(query, conn)
+        conn.set_session(readonly=True)          # this job must never be able to write
+        return pd.read_sql(query, conn, params=params)
 
+
+def _sales_lines_sql(select: str, group_by: str) -> str:
+    """Online order lines UNION ALL cashier POS lines, closed months only. `select`/`group_by` are fixed strings
+    from this file (never user input)."""
+    return f"""
+        WITH lines AS (
+            SELECT {_ORDER_MONTH} AS month, p.id AS product_id, p.sku AS msku, p.name AS product_name,
+                   UPPER(TRIM(p.category)) AS category,
+                   oi.quantity::float AS qty, (oi.price * oi.quantity)::float AS amount
+            FROM order_items oi
+            JOIN products p ON p.id = oi.product_id
+            JOIN orders o ON o.id = oi.order_id
+            WHERE LOWER(o.status) IN %(statuses)s
+              AND p.category IS NOT NULL AND p.category <> ''
+            UNION ALL
+            SELECT {_POS_MONTH}, p.id, p.sku, p.name, UPPER(TRIM(p.category)),
+                   si.quantity::float, si.line_total::float
+            FROM pos_sale_items si
+            JOIN pos_sales s ON s.id = si.sale_id
+            JOIN products p ON p.id = si.product_id
+            WHERE s.status = 'completed'
+              AND p.category IS NOT NULL AND p.category <> ''
+        )
+        SELECT {select}
+        FROM lines
+        WHERE month < {_THIS_MONTH_START}
+        GROUP BY {group_by}
+        ORDER BY {group_by}
+    """
+
+
+def fetch_monthly_sales() -> pd.DataFrame:
+    """One row per (month, category): total units and revenue from counted online orders + completed POS sales."""
+    query = _sales_lines_sql("month, category, SUM(qty) AS units_sold, SUM(amount) AS revenue", "category, month")
+    df = _read_sql(query, {'statuses': COUNTED_ORDER_STATUSES})
     if df.empty:
-        raise RuntimeError("No sales rows returned -- check DB connection / that orders exist.")
-
+        raise RuntimeError("No closed-month sales rows returned -- check DB connection / that sales exist.")
     df['month'] = pd.to_datetime(df['month']).dt.to_period('M')
     df['avg_price'] = np.where(df['units_sold'] > 0, df['revenue'] / df['units_sold'], np.nan)
     return df
+
+
+def fetch_monthly_product_sales() -> pd.DataFrame:
+    """One row per (month, product) in the shape of preprocessed_monthly_product_features.csv."""
+    query = _sales_lines_sql(
+        "month, msku, MAX(product_name) AS product_name, category, SUM(qty) AS units_sold, SUM(amount) AS revenue",
+        "month, msku, category")
+    df = _read_sql(query, {'statuses': COUNTED_ORDER_STATUSES})
+    df['month'] = pd.to_datetime(df['month']).dt.to_period('M')
+    return df
+
+
+def filter_known_categories(df: pd.DataFrame, col: str, allow_new: bool) -> pd.DataFrame:
+    """The models only know the categories in category_code_map.json. A category they have never seen would get a
+    brand-new code and almost no history, so by default it is reported and skipped instead of silently added."""
+    known = set(json.load(open(CATEGORY_MAP_PATH))) if CATEGORY_MAP_PATH.exists() else set()
+    if allow_new or not known:
+        return df
+    unknown = sorted(set(df[col].unique()) - known)
+    if unknown:
+        print(f"Skipped {len(unknown)} categor(y/ies) the model has no code for (use --allow-new-categories to keep): {unknown}")
+    return df[df[col].isin(known)]
+
+
+def merge_product_history(existing: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
+    """Append live product-months AFTER the last month already in the file. Older rows are never touched."""
+    last = existing['Month'].max() if not existing.empty else ''
+    live = live.copy()
+    live['Month'] = live['month'].astype(str)
+    live = live[live['Month'] > last]
+    live = live[live['msku'].notna() & (live['msku'].astype(str).str.strip() != '')]
+    rows = pd.DataFrame({
+        'Month': live['Month'], 'MSKU': live['msku'].astype(str), 'Product Name': live['product_name'],
+        'Category': live['category'], 'units_sold': live['units_sold'].round(1), 'revenue': live['revenue'].round(2),
+        'returns_units': 0.0, 'returns_amount': 0.0, 'net_revenue': live['revenue'].round(2),
+        'avg_price': (live['revenue'] / live['units_sold'].where(live['units_sold'] > 0)).round(2),
+    })
+    return pd.concat([existing, rows], ignore_index=True).sort_values(['Month', 'Category', 'MSKU'])
 
 
 # -----------------------------------------------------------------
@@ -269,16 +344,24 @@ def sync_category_codes(df: pd.DataFrame) -> dict:
     return code_map
 
 
+def _write_atomic(df: pd.DataFrame, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    df.to_csv(tmp, index=False)
+    tmp.replace(path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true', help="Preview the result, don't overwrite the CSV")
+    parser.add_argument('--allow-new-categories', action='store_true',
+                        help="Keep product categories the models have no code for (they get a new code).")
     args = parser.parse_args()
 
     print("Reading existing POS-era historical data (kept as-is, never overwritten)...")
     old_base = load_existing_base()
 
-    print("Connecting to the database and pulling real live-order transactions...")
-    live_base = fetch_monthly_sales()
+    print("Connecting to the database and pulling closed-month sales (counted orders + completed POS sales)...")
+    live_base = filter_known_categories(fetch_monthly_sales(), 'category', args.allow_new_categories)
 
     print("Merging: POS history stays fixed, only genuinely new live months are added...")
     monthly = merge_base(old_base, live_base)
@@ -290,25 +373,39 @@ def main():
     featured = add_features(full)
 
     print("Checking for any new categories not yet known to the model...")
+    if args.dry_run:
+        # sync_category_codes writes category_code_map.json when it finds a new category; keep dry runs read-only
+        original_map = CATEGORY_MAP_PATH.read_bytes() if CATEGORY_MAP_PATH.exists() else None
     sync_category_codes(featured)
+    if args.dry_run:
+        if original_map is None:
+            CATEGORY_MAP_PATH.unlink(missing_ok=True)
+        else:
+            CATEGORY_MAP_PATH.write_bytes(original_map)
 
     featured = featured[OUTPUT_COLUMNS].sort_values(['Category', 'Month']).reset_index(drop=True)
+
+    print("Topping up the per-product history the running service reads...")
+    prod_existing = pd.read_csv(PRODUCT_HISTORY_PATH, dtype={'MSKU': str}) if PRODUCT_HISTORY_PATH.exists() else pd.DataFrame()
+    prod_live = filter_known_categories(fetch_monthly_product_sales(), 'category', args.allow_new_categories)
+    prod_new = merge_product_history(prod_existing, prod_live)
 
     old_rows = 0
     if FEATURES_PATH.exists():
         old_rows = sum(1 for _ in open(FEATURES_PATH)) - 1
 
-    print(f"\nOld file: {old_rows} rows")
-    print(f"New file: {len(featured)} rows, categories: {featured['Category'].nunique()}, "
+    print(f"\nCategory file: {old_rows} -> {len(featured)} rows, categories: {featured['Category'].nunique()}, "
           f"months: {featured['Month'].min()} to {featured['Month'].max()}")
+    print(f"Product file:  {len(prod_existing)} -> {len(prod_new)} rows, last month: {prod_new['Month'].max()}")
 
     if args.dry_run:
-        print("\n--dry-run set: NOT writing the file. Preview of the newest month per category:")
+        print("\n--dry-run set: NOT writing the files. Preview of the newest month per category:")
         print(featured.sort_values('Month').groupby('Category').tail(1).to_string(index=False))
         return
 
-    featured.to_csv(FEATURES_PATH, index=False)
-    print(f"\nDone. {FEATURES_PATH.name} has been refreshed with real data.")
+    _write_atomic(featured, FEATURES_PATH)
+    _write_atomic(prod_new, PRODUCT_HISTORY_PATH)
+    print(f"\nDone. {FEATURES_PATH.name} and {PRODUCT_HISTORY_PATH.name} have been refreshed with real data.")
     print("Next step: run `python rebuild_models_v2.py` to retrain the models on this update.")
 
 
