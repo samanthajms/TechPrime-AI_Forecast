@@ -13,6 +13,9 @@ Deployed on Render as a web service (see `render.yaml`). Security setup: [`docs/
 - `rebuild_models_v2.py` splits **chronologically by month, 80% train / 20% test**, redrawn each run. Early stopping uses only the last train months, so the test months are never used for fitting or tuning.
 - Test results feed `category_confidence.csv`, `revenue_category_confidence.csv`, `monthly_predictions.csv`, `revenue_predictions.csv` and `GET /api/metrics`.
 
+## Date-range filter (optional `from` / `to`)
+`/api/forecast/demand` and `/api/forecast/revenue` accept `from=` and `to=` (`YYYY-MM` or `YYYY-MM-DD`). They only choose which **actual** sales months are returned (revenue `history`; demand `range_units` / `range_revenue`). The forecast itself always starts after the latest month in the data and is 1-3 months long.
+
 ## Demo: move the forecast window
 By default forecasts start the month after the last month in the history. To demonstrate output against months whose real sales are known, set `HISTORY_CUTOFF=YYYY-MM` (Render dashboard -> Environment, or locally) and restart/reload:
 

@@ -551,9 +551,19 @@ def get_categories():
     }
 
 
-def get_revenue_forecast(horizon=3, category=None):
+def _in_range(h, start=None, end=None):
+    """Limit a history frame to months start..end ('YYYY-MM', both optional). Display filter only."""
+    if start:
+        h = h[h['Month'] >= start]
+    if end:
+        h = h[h['Month'] <= end]
+    return h
+
+
+def get_revenue_forecast(horizon=3, category=None, start=None, end=None):
     """Sales/Revenue screen. `category` may be a shop label, shop group, or 'model:X'. Returns the total for the
-    selection, a breakdown by shop category and by shop group, and the monthly history for the chart."""
+    selection, a breakdown by shop category and by shop group, and the monthly history for the chart.
+    `start` / `end` ('YYYY-MM') only limit which ACTUAL months are returned as history; they never change the forecast."""
     check_horizon(horizon)
     df = _product_forecast(horizon)
     h = _history()
@@ -564,6 +574,7 @@ def get_revenue_forecast(horizon=3, category=None):
                     kind, val)
     else:
         h = h.rename(columns={'Shop Category': 'category', 'Shop Group': 'shop_group', 'Category': 'model_category'})
+    h = _in_range(h, start, end)
     if df.empty:                                  # valid category, but nothing to forecast: answer 200 with an empty state
         hist = h.groupby('Month').agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')).reset_index() \
             .rename(columns={'Month': 'month'})
@@ -584,9 +595,10 @@ def get_revenue_forecast(horizon=3, category=None):
             'history_by_category': hist_cat.round(2).to_dict('records')}
 
 
-def get_product_demand(horizon=3, category=None, top=50):
+def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
     """Product Demand screen: per-product forecast with product NAME, MSKU, shop category/group, last-3-month units,
-    forecast units + range, forecast revenue, trend and a data-quality / reliability flag."""
+    forecast units + range, forecast revenue, trend and a data-quality / reliability flag.
+    `start` / `end` ('YYYY-MM') add range_units / range_revenue = ACTUAL sales in that date range; forecast is unchanged."""
     check_horizon(horizon)
     df = _product_forecast(horizon)
     if category:
@@ -611,8 +623,13 @@ def get_product_demand(horizon=3, category=None, top=50):
             'confidence': 'low (thin history)' if active < 6 else 'category-based',
             'model_reliability': rel.get(p.model_category, 'unknown'),
         })
+    if start or end:
+        rg = _in_range(_history(), start, end).groupby('MSKU')[['units_sold', 'revenue']].sum()
+        for r in rows:
+            r['range_units'] = int(rg['units_sold'].get(r['msku'], 0))
+            r['range_revenue'] = round(float(rg['revenue'].get(r['msku'], 0)), 2)
     rows.sort(key=lambda r: r['forecast_units'], reverse=True)
-    out = {'horizon_months': horizon, 'filter': {'kind': kind, 'value': val} if category else None,
+    out = {'horizon_months': horizon, 'range': {'from': start, 'to': end} if (start or end) else None, 'filter': {'kind': kind, 'value': val} if category else None,
             'products': rows[:int(top)], 'total_products': len(rows)}
     if not rows:
         out['message'] = "No forecast is available for this category yet (it has no trained model category, or no product in it sold in the last 6 months)."
