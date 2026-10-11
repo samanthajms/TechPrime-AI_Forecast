@@ -9,7 +9,7 @@ Deployed on Render as a web service (see `render.yaml`). Security setup: [`docs/
 - `POST /api/reload` needs `X-Admin-Key` (`FORECAST_ADMIN_KEY`); it is disabled when that variable is unset.
 
 ## Data and the 80/20 split
-- Initial input: the historical POS export (2024-01 to 2026-08), already built into `preprocessed_monthly_features.csv` (per category, used for training) and `preprocessed_monthly_product_features.csv` (per product, read by the running service).
+- Initial input: the historical POS export (2024-01 to 2026-09; September 2026 is an estimate until the real export is loaded), already built into `preprocessed_monthly_features.csv` (per category, used for training) and `preprocessed_monthly_product_features.csv` (per product, read by the running service).
 - `rebuild_models_v2.py` splits **chronologically by month, 80% train / 20% test**, redrawn each run. Early stopping uses only the last train months, so the test months are never used for fitting or tuning.
 - Test results feed `category_confidence.csv`, `revenue_category_confidence.csv`, `monthly_predictions.csv`, `revenue_predictions.csv` and `GET /api/metrics`.
 

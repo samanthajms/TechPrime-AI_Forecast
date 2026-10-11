@@ -124,7 +124,7 @@ class Pipeline(unittest.TestCase):
 
     def test_sales_query_counts_only_closed_months_and_valid_statuses(self):
         import rebuild_features_from_db as r
-        sql = r._sales_lines_sql("month", "month")
+        sql = r._sales_lines_sql()
         self.assertIn("month < date_trunc('month', now() AT TIME ZONE 'Asia/Manila')", sql)
         self.assertIn("pos_sale_items", sql)
         self.assertIn("s.status = 'completed'", sql)

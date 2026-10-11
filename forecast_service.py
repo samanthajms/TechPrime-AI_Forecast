@@ -193,6 +193,11 @@ def revenue():
         horizon=_horizon(), category=_category(), start=_range()[0], end=_range()[1]))
 
 
+@app.route("/api/forecast/table")             # Forecast table by system product category (labels -> groups -> total)
+def table():
+    return _safe(lambda: forecast.get_forecast_table(horizon=_horizon(), category=_category()))
+
+
 @app.route("/api/forecast")                   # backward compatible with the existing forecast_api.php
 def legacy():
     return _safe(lambda: forecast.get_forecast(

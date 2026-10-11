@@ -45,6 +45,7 @@ import pandas as pd
 import xgboost as xgb
 import functools
 import category_alignment as ca
+import intermittent
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -308,21 +309,39 @@ def get_forecast(category=None, product=None, horizon=1):
     demand_rmse = float(_cat_confidence.loc[cat, 'rmse']) if cat in _cat_confidence.index else float(demand_series['units_sold'].std())
     revenue_rmse = float(_revenue_confidence.loc[cat, 'rmse']) if cat in _revenue_confidence.index else float(revenue_series['revenue'].std())
 
+    # Method per category (see intermittent.py): 'zero_rule' = nothing sold in the last ZERO_RULE_MONTHS (default 3)
+    # months -> forecast 0; 'croston' = opt-in (SPARSE_METHOD=croston) for low-volume categories; else 'xgboost'.
+    units_hist = demand_series['units_sold'].values
+    method = intermittent.method_for(units_hist)
+    if method == 'zero_rule':
+        flat_units, flat_price, flat_band = 0.0, 0.0, 0.0
+    elif method == 'croston':
+        flat_units = intermittent.croston_sba(units_hist)
+        flat_price = intermittent.trailing_price(units_hist, revenue_series['revenue'].values)
+        flat_band = float(max(units_hist[-12:].std(ddof=1), 1.0)) if len(units_hist) > 1 else 1.0
+
     results = []
     for step in range(1, horizon + 1):
-        # --- demand model ---
-        d_feats, next_month = _build_demand_features(demand_series)
-        d_feats['category_code'] = cat_code
-        Xd = pd.DataFrame([d_feats])[DEMAND_FEATURES]
-        units_pred = float(np.clip(_demand_model.predict(Xd)[0], 0, None))
-        d_band = demand_rmse * (1 + 0.3 * (step - 1))
+        if method != 'xgboost':
+            next_month = demand_series['Month'].iloc[-1] + 1
+            units_pred = flat_units
+            revenue_pred = flat_units * flat_price
+            d_band = flat_band * (1 + 0.3 * (step - 1))
+            r_band = d_band * flat_price
+        else:
+            # --- demand model ---
+            d_feats, next_month = _build_demand_features(demand_series)
+            d_feats['category_code'] = cat_code
+            Xd = pd.DataFrame([d_feats])[DEMAND_FEATURES]
+            units_pred = float(np.clip(_demand_model.predict(Xd)[0], 0, None))
+            d_band = demand_rmse * (1 + 0.3 * (step - 1))
 
-        # --- revenue model ---
-        r_feats, _ = _build_revenue_features(revenue_series)
-        r_feats['category_code'] = cat_code
-        Xr = pd.DataFrame([r_feats])[REVENUE_FEATURES]
-        revenue_pred = float(np.clip(_revenue_model.predict(Xr)[0], 0, None))
-        r_band = revenue_rmse * (1 + 0.3 * (step - 1))
+            # --- revenue model ---
+            r_feats, _ = _build_revenue_features(revenue_series)
+            r_feats['category_code'] = cat_code
+            Xr = pd.DataFrame([r_feats])[REVENUE_FEATURES]
+            revenue_pred = float(np.clip(_revenue_model.predict(Xr)[0], 0, None))
+            r_band = revenue_rmse * (1 + 0.3 * (step - 1))
 
         row = {
             'month': str(next_month),
@@ -536,6 +555,82 @@ def _aggregate_forecast(kind, val, horizon):
         raise ValueError(f"No forecastable products with enough history in '{val}'.")
     agg = _rollup(df, [])
     return [{'month': r['month'], **_fmt(r)} for _, r in agg.sort_values('month').iterrows()]
+
+
+_RELIABILITY_ORDER = {'high': 0, 'medium': 1, 'low': 2, 'unknown': 3}
+
+
+def _method_label(mc):
+    return {'zero_rule': 'zero rule (no sales in the last %d months)' % intermittent.zero_rule_months(),
+            'croston': 'Croston (low volume)', 'xgboost': 'XGBoost'}[intermittent.method_for(_monthly_series(mc)['units_sold'].values)]
+
+
+def get_forecast_table(horizon=3, category=None):
+    """Forecast table by SYSTEM product category (the Client/Custodian labels, grouped by the 8 menu groups).
+
+    Flow: forecast each MODEL category (XGBoost) -> split it over the products that sell in it (12-month share) ->
+    merge those products by their system category -> one table row per label, one subtotal per group, one grand total.
+    All 39 labels are listed in menu order; a label with nothing to forecast has status 'no_recent_sales' (sold before,
+    but no product sold in the last 6 months) or 'no_history' (no model category / never sold) and null numbers.
+    `category` (optional) limits the table to a label, a group or 'model:X'. Bands add linearly inside one model
+    category and in quadrature across model categories (same rule as the other screens)."""
+    check_horizon(horizon)
+    df = _product_forecast(horizon)
+    flt = None
+    if category:
+        flt = ca.resolve_filter(category)
+        df = _filter(df, *flt)
+    h = _history()
+    last3 = sorted(h['Month'].unique())[-3:]
+    recent = h[h['Month'].isin(last3)].groupby('Shop Category')[['units_sold', 'revenue']].sum()
+    ever_sold = set(h['Shop Category'])
+    months = sorted(df['month'].unique()) if not df.empty else []
+    roll = _rollup(df, ['category']) if not df.empty else pd.DataFrame()
+    rows = []
+    for group, labels in ca.taxonomy()['groups'].items():
+        for lab in labels:
+            sub = df[df['category'] == lab]
+            if flt and sub.empty:
+                continue                                           # filtered view: only rows that have a forecast
+            r3 = recent.loc[lab] if lab in recent.index else None
+            row = {'group': group, 'category': lab,
+                   'n_products': int(sub['msku'].nunique()) if not sub.empty else 0,
+                   'model_categories': sorted(sub['model_category'].unique()) if not sub.empty else [],
+                   'last_3m_units': int(r3['units_sold']) if r3 is not None else 0,
+                   'last_3m_revenue': round(float(r3['revenue']), 2) if r3 is not None else 0.0}
+            if sub.empty:
+                row.update({'status': 'no_recent_sales' if lab in ever_sold else 'no_history', 'method': None,
+                            'reliability': None, 'forecast': [], 'forecast_units_total': None, 'forecast_revenue_total': None})
+            else:
+                f = roll[roll['category'] == lab].sort_values('month')
+                fc = [{'month': r['month'], **_fmt(r)} for _, r in f.iterrows()]
+                rels = [get_forecast_confidence(mc, 'demand')['reliability'] for mc in row['model_categories']]
+                row.update({'status': 'forecast',
+                            'method': sorted({_method_label(mc) for mc in row['model_categories']}),
+                            'reliability': max(rels, key=lambda x: _RELIABILITY_ORDER.get(x.split()[0], 3)),
+                            'forecast': fc,
+                            'forecast_units_total': round(sum(x['predicted_units'] for x in fc), 1),
+                            'forecast_revenue_total': round(sum(x['predicted_revenue'] for x in fc), 2)})
+            rows.append(row)
+    groups = []
+    if not df.empty:
+        gr = _rollup(df, ['shop_group'])
+        for group in ca.taxonomy()['groups']:
+            g = gr[gr['shop_group'] == group].sort_values('month')
+            if g.empty:
+                continue
+            gl = [r for r in rows if r['group'] == group]
+            fc = [{'month': r['month'], **_fmt(r)} for _, r in g.iterrows()]
+            groups.append({'group': group, 'n_products': sum(r['n_products'] for r in gl),
+                           'last_3m_units': sum(r['last_3m_units'] for r in gl), 'forecast': fc,
+                           'forecast_units_total': round(sum(x['predicted_units'] for x in fc), 1),
+                           'forecast_revenue_total': round(sum(x['predicted_revenue'] for x in fc), 2)})
+    total = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()] if not df.empty else []
+    return {'horizon_months': horizon, 'months': months, 'last_actual_month': str(max(h['Month'])),
+            'filter': {'kind': flt[0], 'value': flt[1]} if flt else None,
+            'rows': rows, 'groups': groups, 'total': total,
+            'note': ("Forecast per model category (XGBoost), merged to system categories through each product's "
+                     "12-month share. Categories with no sales in the last %d months are forecast at 0." % intermittent.zero_rule_months())}
 
 
 def get_categories():

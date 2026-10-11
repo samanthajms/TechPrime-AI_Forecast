@@ -69,6 +69,7 @@ CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
 MONTHLY_PREDICTIONS_PATH = BASE_DIR / 'monthly_predictions.csv'
 REVENUE_PREDICTIONS_PATH = BASE_DIR / 'revenue_predictions.csv'
+BASELINE_REPORT_PATH = BASE_DIR / 'model_vs_baseline.csv'
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
@@ -165,8 +166,54 @@ def _gate_report(confidence, target_name, threshold):
     return overall_relative_error, failing
 
 
+DENSE_MIN_AVG = 10   # categories averaging fewer units/month than this are "sparse": WAPE/MASE on them is mostly noise
+
+
+def _baseline_report(train_df, test_df, preds, target_col, lag_col, roll_col, label, dense_cats=None):
+    """Score the model against two free baselines on the held-out months: repeat last month (naive) and the previous
+    6-month average. A model that cannot beat them is not adding anything. Metrics: WAPE = sum|err| / sum(actual) and
+    MASE = MAE / (MAE of the naive one-step forecast over the TRAIN months; <1 means better than repeating last month).
+    Dense and sparse categories are summarised separately. Returns (per-category DataFrame, model-vs-ma6 verdict)."""
+    d = test_df[['Month', 'Category', target_col, lag_col, roll_col]].copy()
+    d['model'] = preds
+    d = d[d['Category'] != 'All']                           # aggregate row, not a product bucket
+    rows = []
+    for cat, g in d.groupby('Category'):
+        actual = g[target_col].values
+        tr = train_df[train_df['Category'] == cat].sort_values('Month')[target_col].values
+        naive_train_mae = float(np.abs(np.diff(tr)).mean()) if len(tr) > 1 else np.nan
+        denom = actual.sum()
+        rows.append({
+            'Category': cat, 'avg_actual': float(actual.mean()),
+            'wape_model': float(np.abs(actual - g['model']).sum() / denom) if denom > 0 else np.nan,
+            'wape_naive': float(np.abs(actual - g[lag_col]).sum() / denom) if denom > 0 else np.nan,
+            'wape_ma6': float(np.abs(actual - g[roll_col]).sum() / denom) if denom > 0 else np.nan,
+            'mase_model': float(np.abs(actual - g['model']).mean() / naive_train_mae) if naive_train_mae and naive_train_mae > 0 else np.nan,
+            'bias_model': float((g['model'].sum() - denom) / denom) if denom > 0 else np.nan,
+        })
+    rep = pd.DataFrame(rows).set_index('Category')
+    # dense/sparse is decided on UNITS (pass dense_cats for the revenue report: peso amounts would make everything dense)
+    rep['dense'] = rep.index.isin(dense_cats) if dense_cats is not None else rep['avg_actual'] >= DENSE_MIN_AVG
+
+    print(f"\n--- MODEL vs BASELINES: {label} (held-out months; WAPE = volume-weighted error, lower is better) ---")
+    verdict = {}
+    for name, sub in (('dense  (avg >= %d/month)' % DENSE_MIN_AVG, rep[rep['dense']]), ('sparse (avg <  %d/month)' % DENSE_MIN_AVG, rep[~rep['dense']])):
+        if sub.empty:
+            continue
+        w = sub['avg_actual']                                    # weight categories by volume
+        agg = {k: float((sub[k].fillna(0) * w).sum() / w.sum()) for k in ('wape_model', 'wape_naive', 'wape_ma6')}
+        print(f"  {name}: {len(sub):2d} categories | model {agg['wape_model']:.1%} | repeat-last-month {agg['wape_naive']:.1%} | "
+              f"6-month average {agg['wape_ma6']:.1%} | mean MASE {sub['mase_model'].mean():.2f}")
+        verdict[name.split()[0]] = agg
+    losing = rep[rep['dense'] & (rep['wape_model'] > rep['wape_ma6'])].sort_values('avg_actual', ascending=False)
+    if len(losing):
+        print(f"  {len(losing)} dense categor(y/ies) where the 6-month average beats the model: "
+              + ', '.join(f"{c} ({r['wape_model']:.0%} vs {r['wape_ma6']:.0%})" for c, r in losing.iterrows()))
+    return rep, verdict
+
+
 ARTIFACTS = [DEMAND_MODEL_PATH, REVENUE_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, REVENUE_CONFIDENCE_PATH,
-             MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH]
+             MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH, BASELINE_REPORT_PATH]
 
 
 def _overall_rel_error(conf_df):
@@ -210,6 +257,9 @@ def main():
                          help="(default on) Do not overwrite the live artifacts if the new models' overall relative "
                               "error is worse than the currently deployed models'. --no-enforce-gate to override. "
                               "Backups are always taken before an overwrite.")
+    parser.add_argument('--require-beat-baseline', action='store_true',
+                         help="Also fail (exit 2, nothing overwritten) when the new DEMAND model's volume-weighted WAPE on "
+                              "dense categories is worse than simply using the previous 6-month average. Off by default.")
     parser.add_argument('--train-fraction', type=float, default=TRAIN_FRACTION,
                          help="Chronological train fraction. Default 0.8 (80/20).")
     args = parser.parse_args()
@@ -232,6 +282,16 @@ def main():
     revenue_preds = np.clip(revenue_model.predict(test_df[REVENUE_FEATURES]), 0, None)
     revenue_log, revenue_confidence = _per_category_confidence(test_df, revenue_preds, 'revenue')
 
+    # ---------------- Baseline comparison (informational unless --require-beat-baseline) ----------------
+    demand_base, demand_verdict = _baseline_report(train_df, test_df, demand_preds, 'units_sold', 'lag_1', 'roll_mean_6', 'demand (units)')
+    revenue_base, _ = _baseline_report(train_df, test_df, revenue_preds, 'revenue', 'revenue_lag_1', 'revenue_roll_mean_6', 'revenue',
+                                       dense_cats=set(demand_base.index[demand_base['dense']]))
+    beats_baseline = ('dense' not in demand_verdict) or demand_verdict['dense']['wape_model'] <= demand_verdict['dense']['wape_ma6']
+    if args.require_beat_baseline and not beats_baseline:
+        print("\nBASELINE GATE FAILED: on dense categories the new demand model is worse than the 6-month average. "
+              "Nothing was overwritten.")
+        raise SystemExit(2)
+
     # ---------------- Promotion gate + backup ----------------
     if args.enforce_gate and not _passes_regression_gate(demand_confidence, revenue_confidence):
         print("\nGATE FAILED: new models are worse than the deployed ones. Nothing was overwritten.")
@@ -245,6 +305,9 @@ def main():
     revenue_model.save_model(str(REVENUE_MODEL_PATH))
     demand_confidence.to_csv(CATEGORY_CONFIDENCE_PATH)
     revenue_confidence.to_csv(REVENUE_CONFIDENCE_PATH)
+
+    baseline_out = demand_base.add_prefix('demand_').join(revenue_base.add_prefix('revenue_'), how='outer')
+    baseline_out.to_csv(BASELINE_REPORT_PATH)
 
     demand_log_out = demand_log.copy()
     demand_log_out['Month'] = demand_log_out['Month'].astype(str)

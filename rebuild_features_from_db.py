@@ -35,6 +35,8 @@ WHAT IT DOES, STEP BY STEP:
      across the FULL combined timeline (old + newly added), so months near
      the boundary between old and new data still get correct trend values.
   7. Writes the combined result back to preprocessed_monthly_features.csv.
+  7b. Maps each product to a MODEL bucket (SKU history -> stored bucket name -> LABEL_TO_BUCKET) so products.category
+     can hold the shop labels (Monitor, CPU Cooling, ...) without products falling out of the forecast.
   8. Keeps category_code_map.json in sync: if the database has a category
      the model has never seen before, it's added with a new code instead of
      silently crashing.
@@ -45,7 +47,7 @@ WHEN TO RUN THIS:
   retrain the models on the refreshed data.
 
 WHAT COUNTS AS A SALE (so a spam or cancelled order cannot skew the forecast):
-  - online orders whose status is in COUNTED_ORDER_STATUSES (not cancelled / unpaid),
+  - online orders whose status is in COUNTED_ORDER_STATUSES (to_ship / to_receive / to_review; not cancelled / unpaid),
   - cashier POS sales with status 'completed' (walk-in sales; voided ones are ignored),
   - CLOSED calendar months only (Asia/Manila) -- a half-finished month is never fed to the model.
 
@@ -87,9 +89,13 @@ DB_CONFIG = {
     'sslmode': 'require',
 }
 
-# Online-order statuses that count as real demand (see ias_order_display_status in the PHP app). Everything else --
-# 'Pending', 'to_pay' (unpaid), 'cancelled', anything unknown -- is left out on purpose.
-COUNTED_ORDER_STATUSES = ('to_ship', 'to_receive', 'delivered', 'completed')
+# Online-order statuses that count as real demand. The live orders.status CHECK constraint only allows
+#   to_pay | to_ship | to_receive | to_review | cancelled
+# so the counted ones are: to_ship (paid, packing), to_receive (in transit) and to_review (parcel received -- this is the
+# "completed" state of the shop, it is where every finished order ends up). 'delivered' / 'completed' can never occur in
+# the current schema; they are kept only so an older/other database that uses those words still works.
+# Left out on purpose: to_pay (unpaid), cancelled, anything unknown.
+COUNTED_ORDER_STATUSES = ('to_ship', 'to_receive', 'to_review', 'delivered', 'completed')
 
 # Calendar month in Asia/Manila. created_at columns are timestamp-without-tz holding UTC.
 _ORDER_MONTH = "date_trunc('month', (o.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date"
@@ -131,67 +137,134 @@ def _read_sql(query: str, params: tuple = ()) -> pd.DataFrame:
         return pd.read_sql(query, conn, params=params)
 
 
-def _sales_lines_sql(select: str, group_by: str) -> str:
-    """Online order lines UNION ALL cashier POS lines, closed months only. `select`/`group_by` are fixed strings
-    from this file (never user input)."""
+def _sales_lines_sql() -> str:
+    """Online order lines UNION ALL cashier POS lines, closed months only, ONE ROW PER LINE with the product's raw
+    stored category. Mapping to a model bucket happens in Python (assign_buckets) because products.category now holds
+    shop labels (Monitor, CPU Cooling, ...) while the models are trained on POS buckets (DISPLAY, COOLING, ...)."""
     return f"""
         WITH lines AS (
             SELECT {_ORDER_MONTH} AS month, p.id AS product_id, p.sku AS msku, p.name AS product_name,
-                   UPPER(TRIM(p.category)) AS category,
+                   TRIM(p.category) AS raw_category,
                    oi.quantity::float AS qty, (oi.price * oi.quantity)::float AS amount
             FROM order_items oi
             JOIN products p ON p.id = oi.product_id
             JOIN orders o ON o.id = oi.order_id
             WHERE LOWER(o.status) IN %(statuses)s
-              AND p.category IS NOT NULL AND p.category <> ''
             UNION ALL
-            SELECT {_POS_MONTH}, p.id, p.sku, p.name, UPPER(TRIM(p.category)),
+            SELECT {_POS_MONTH}, p.id, p.sku, p.name, TRIM(p.category),
                    si.quantity::float, si.line_total::float
             FROM pos_sale_items si
             JOIN pos_sales s ON s.id = si.sale_id
             JOIN products p ON p.id = si.product_id
             WHERE s.status = 'completed'
-              AND p.category IS NOT NULL AND p.category <> ''
         )
-        SELECT {select}
+        SELECT month, product_id, msku, product_name, raw_category, qty, amount
         FROM lines
         WHERE month < {_THIS_MONTH_START}
-        GROUP BY {group_by}
-        ORDER BY {group_by}
     """
 
 
-def fetch_monthly_sales() -> pd.DataFrame:
-    """One row per (month, category): total units and revenue from counted online orders + completed POS sales."""
-    query = _sales_lines_sql("month, category, SUM(qty) AS units_sold, SUM(amount) AS revenue", "category, month")
-    df = _read_sql(query, {'statuses': COUNTED_ORDER_STATUSES})
+def fetch_sales_lines() -> pd.DataFrame:
+    """Every counted sales line of every closed month (small table: a few thousand rows at most)."""
+    df = _read_sql(_sales_lines_sql(), {'statuses': COUNTED_ORDER_STATUSES})
     if df.empty:
         raise RuntimeError("No closed-month sales rows returned -- check DB connection / that sales exist.")
     df['month'] = pd.to_datetime(df['month']).dt.to_period('M')
+    df['msku'] = df['msku'].astype(str).str.strip()
+    return df
+
+
+# -----------------------------------------------------------------
+# Category -> model bucket
+#
+# The models know 33 POS buckets (keys of category_code_map.json). products.category holds either
+#   (a) the old coarse values (Display, Audio, Cooling, ...)   -> already a bucket name, or
+#   (b) the shop labels written by 03_apply_align_categories.sql (Monitor, CPU Cooling, Laptops, ...).
+# A product is mapped in this order:
+#   1. its SKU in the product history file (that is exactly the bucket the model was trained on -- the only way to
+#      tell the 7 LAPTOP buckets, or "Others" = network device / accessory / customization, apart);
+#   2. the stored category if it already IS a model bucket (PC Case, Memory, Mouse, ...);
+#   3. LABEL_TO_BUCKET for shop labels whose name differs from the bucket;
+#   4. otherwise: unmapped -> skipped and listed in the report (never silently dropped).
+# -----------------------------------------------------------------
+LABEL_TO_BUCKET = {
+    'monitor': 'DISPLAY', 'projector': 'DISPLAY',
+    'graphics card': 'GRAPHIC CARD', 'gpu': 'GRAPHIC CARD',
+    'cpu cooling': 'COOLING', 'chassis fan': 'COOLING',
+    'processor amd': 'PROCESSOR', 'processor intel': 'PROCESSOR', 'processor tray': 'PROCESSOR',
+    'headset': 'AUDIO', 'earphones': 'AUDIO',
+    'cables': 'CABLES AND ADAPTERS',
+    'keyboard and mouse': 'COMBO',
+    'printer & scanner': 'PRINTER AND SCANNER',
+    'desktop': 'MINI PC', 'chromebook': 'MINI PC',
+    'cctv': 'CAMERA', 'recorder': 'CAMERA', 'web & digital camera': 'CAMERA',
+    'power bank': 'ACCESSORIES', 'chairs': 'ACCESSORIES', 'tables': 'ACCESSORIES',
+    'ram': 'MEMORY', 'psu': 'POWER SUPPLY', 'case': 'PC CASE', 'ssd': 'SOLID STATE DRIVE', 'hdd': 'HARD DISK',
+    # Not mapped on purpose (no bucket / several buckets -> need the SKU history or a deliberate decision):
+    #   Laptops (7 LAPTOP xx buckets), Others, Antivirus, Office Applications, Operating System, Mobile Phone, Tablet
+}
+
+
+def load_sku_bucket_lookup() -> dict:
+    """MSKU -> model bucket, taken from the newest row of each SKU in the per-product history file."""
+    if not PRODUCT_HISTORY_PATH.exists():
+        return {}
+    h = pd.read_csv(PRODUCT_HISTORY_PATH, dtype={'MSKU': str})
+    h['MSKU'] = h['MSKU'].astype(str).str.strip()
+    h = h.sort_values('Month').drop_duplicates('MSKU', keep='last')
+    return dict(zip(h['MSKU'], h['Category'].astype(str).str.upper().str.strip()))
+
+
+def resolve_bucket(msku: str, raw_category, known: set, sku_lookup: dict):
+    """Model bucket (UPPER-case, as in category_code_map.json) for one product, or None if it cannot be mapped."""
+    hit = sku_lookup.get(str(msku).strip())
+    if hit and (not known or hit in known):
+        return hit
+    raw = str(raw_category or '').strip().upper()
+    if raw and (not known or raw in known):
+        return raw
+    return LABEL_TO_BUCKET.get(raw.lower())
+
+
+def assign_buckets(lines: pd.DataFrame, allow_new: bool) -> pd.DataFrame:
+    """Add the `category` (model bucket) column; unmapped lines are reported and dropped (or, with --allow-new-categories,
+    kept under their own upper-cased name so they get a new model code)."""
+    known = {k.upper() for k in json.load(open(CATEGORY_MAP_PATH))} if CATEGORY_MAP_PATH.exists() else set()
+    sku_lookup = load_sku_bucket_lookup()
+    lines = lines.copy()
+    lines['category'] = [resolve_bucket(m, c, known, sku_lookup) for m, c in zip(lines['msku'], lines['raw_category'])]
+
+    unmapped = lines['category'].isna()
+    if unmapped.any():
+        rep = (lines[unmapped].groupby(['raw_category', 'msku', 'product_name'], dropna=False)
+               .agg(units=('qty', 'sum'), revenue=('amount', 'sum')).reset_index()
+               .sort_values('revenue', ascending=False))
+        print(f"{len(rep)} product(s) / {int(rep['units'].sum())} units have no model bucket "
+              f"({'kept under their own name' if allow_new else 'SKIPPED'}):")
+        print(rep.head(25).to_string(index=False))
+        print("  -> to forecast them, add the SKU to the product history with a bucket, or extend LABEL_TO_BUCKET.")
+        if allow_new:
+            lines.loc[unmapped, 'category'] = lines.loc[unmapped, 'raw_category'].fillna('').str.upper().replace('', np.nan)
+    mapped = lines.dropna(subset=['category'])
+    print(f"Category mapping: {len(mapped)}/{len(lines)} sales lines mapped to a model bucket "
+          f"({mapped['category'].nunique()} buckets).")
+    if mapped.empty:
+        raise RuntimeError("No sales line could be mapped to a model bucket -- check products.category / the history file.")
+    return mapped
+
+
+def monthly_from_lines(lines: pd.DataFrame) -> pd.DataFrame:
+    """One row per (month, bucket): total units and revenue."""
+    df = (lines.groupby(['category', 'month'], as_index=False)
+          .agg(units_sold=('qty', 'sum'), revenue=('amount', 'sum')))
     df['avg_price'] = np.where(df['units_sold'] > 0, df['revenue'] / df['units_sold'], np.nan)
     return df
 
 
-def fetch_monthly_product_sales() -> pd.DataFrame:
+def product_monthly_from_lines(lines: pd.DataFrame) -> pd.DataFrame:
     """One row per (month, product) in the shape of preprocessed_monthly_product_features.csv."""
-    query = _sales_lines_sql(
-        "month, msku, MAX(product_name) AS product_name, category, SUM(qty) AS units_sold, SUM(amount) AS revenue",
-        "month, msku, category")
-    df = _read_sql(query, {'statuses': COUNTED_ORDER_STATUSES})
-    df['month'] = pd.to_datetime(df['month']).dt.to_period('M')
-    return df
-
-
-def filter_known_categories(df: pd.DataFrame, col: str, allow_new: bool) -> pd.DataFrame:
-    """The models only know the categories in category_code_map.json. A category they have never seen would get a
-    brand-new code and almost no history, so by default it is reported and skipped instead of silently added."""
-    known = set(json.load(open(CATEGORY_MAP_PATH))) if CATEGORY_MAP_PATH.exists() else set()
-    if allow_new or not known:
-        return df
-    unknown = sorted(set(df[col].unique()) - known)
-    if unknown:
-        print(f"Skipped {len(unknown)} categor(y/ies) the model has no code for (use --allow-new-categories to keep): {unknown}")
-    return df[df[col].isin(known)]
+    return (lines.groupby(['month', 'msku', 'category'], as_index=False)
+            .agg(product_name=('product_name', 'max'), units_sold=('qty', 'sum'), revenue=('amount', 'sum')))
 
 
 def merge_product_history(existing: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
@@ -280,22 +353,27 @@ def add_features(full: pd.DataFrame) -> pd.DataFrame:
                 return arr[i - k] if i - k >= 0 else 0
 
             lag_1, lag_2, lag_3, lag_12 = lag(units, 1), lag(units, 2), lag(units, 3), lag(units, 12)
-            window3 = units[max(0, i - 2):i + 1]
-            window6 = units[max(0, i - 5):i + 1]
+
+            # Rolling windows cover the PREVIOUS months only (same as _build_demand_features / _build_revenue_features,
+            # which use s[-3:] of the history when forecasting the NEXT month). The old code used arr[i-2:i+1], which
+            # includes month i itself -- the value being predicted -- so the model trained on a leaked target and
+            # could not reproduce that accuracy when forecasting. Months before the first one count as 0 (as the lags do).
+            def prev(arr, k):
+                return np.array([arr[i - j] if i - j >= 0 else 0.0 for j in range(1, k + 1)], dtype=float)
+
+            window3, window6 = prev(units, 3), prev(units, 6)
             roll_mean_3 = float(np.mean(window3))
             roll_mean_6 = float(np.mean(window6))
-            roll_std_3 = float(np.std(window3, ddof=1)) if len(window3) > 1 else 0.0
+            roll_std_3 = float(np.std(window3, ddof=1))
 
             r_lag_1 = lag(revenue, 1)
             r_lag_12 = lag(revenue, 12) if i - 12 >= 0 else r_lag_1
-            r_window3 = revenue[max(0, i - 2):i + 1]
-            r_window6 = revenue[max(0, i - 5):i + 1]
-            revenue_roll_mean_3 = float(np.mean(r_window3))
-            revenue_roll_mean_6 = float(np.mean(r_window6))
+            revenue_roll_mean_3 = float(np.mean(prev(revenue, 3)))
+            revenue_roll_mean_6 = float(np.mean(prev(revenue, 6)))
 
             p_lag_1 = lag(price, 1) if i - 1 >= 0 else price[i]
-            p_window3 = price[max(0, i - 2):i + 1]
-            avg_price_roll_mean_3 = float(np.mean(p_window3))
+            p_hist = price[max(0, i - 3):i]
+            avg_price_roll_mean_3 = float(np.mean(p_hist)) if len(p_hist) else float(price[i])
             p_lag_4 = lag(price, 4) if i - 4 >= 0 else None
             price_trend = ((p_lag_1 - p_lag_4) / p_lag_4) if p_lag_4 else 0.0
 
@@ -361,7 +439,8 @@ def main():
     old_base = load_existing_base()
 
     print("Connecting to the database and pulling closed-month sales (counted orders + completed POS sales)...")
-    live_base = filter_known_categories(fetch_monthly_sales(), 'category', args.allow_new_categories)
+    sales_lines = assign_buckets(fetch_sales_lines(), args.allow_new_categories)
+    live_base = monthly_from_lines(sales_lines)
 
     print("Merging: POS history stays fixed, only genuinely new live months are added...")
     monthly = merge_base(old_base, live_base)
@@ -387,7 +466,7 @@ def main():
 
     print("Topping up the per-product history the running service reads...")
     prod_existing = pd.read_csv(PRODUCT_HISTORY_PATH, dtype={'MSKU': str}) if PRODUCT_HISTORY_PATH.exists() else pd.DataFrame()
-    prod_live = filter_known_categories(fetch_monthly_product_sales(), 'category', args.allow_new_categories)
+    prod_live = product_monthly_from_lines(sales_lines)
     prod_new = merge_product_history(prod_existing, prod_live)
 
     old_rows = 0

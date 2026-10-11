@@ -65,8 +65,11 @@ _MODEL_DEFAULT = {
 
 # (regex on the lower-cased product name, label) - first match wins; only consulted for the listed model categories
 _REFINE = {
-    'COOLING': [(r'\b(chassis fan|case fan|sickleflow|argb fan|fan freebie)\b', 'Chassis Fan'),
-                (r'\bfan\b(?!.*(cpu|cooler|heatsink|liquid|aio))', 'Chassis Fan')],
+    # "heatsink fan" / "cpu fan" are CPU coolers (same as the PHP classifier); a bare "fan" is a chassis fan only
+    # when NOTHING in the name mentions cpu/cooler/heatsink/liquid/aio (the old lookahead only checked words AFTER "fan").
+    'COOLING': [(r'\b(heatsink fan|cpu fan)\b', 'CPU Cooling'),
+                (r'\b(chassis fan|case fan|sickleflow|argb fan|fan freebie)\b', 'Chassis Fan'),
+                (r'^(?!.*(cpu|cooler|heatsink|liquid|aio)).*\bfan\b', 'Chassis Fan')],
     'PROCESSOR': [(r'\b(tray|ttp)\b', 'Processor Tray'),
                   (r'\b(ryzen|athlon|amd)\b', 'Processor AMD'),
                   (r'\b(intel|core|pentium|celeron|xeon)\b', 'Processor INTEL')],
@@ -77,8 +80,9 @@ _REFINE = {
                (r'\b(cctv|ip camera|dome|bullet|hiwatch|hikvision|ezviz)\b', 'CCTV')],
     'DISPLAY': [(r'\bprojector\b', 'Projector')],
     'EXTERNAL STORAGE DEVICES': [(r'\b(ssd|solid state)\b', 'Solid State Drive')],
-    'ACCESSORIES': [(r'\bpower ?bank\b', 'Power Bank'),
-                    (r'\b(cable|adapter|converter|hdmi|vga|displayport|usb hub)\b', 'Cables'),
+    'ACCESSORIES': [(r'sinag\d+(?=.*\bcase\b)', 'Keyboard'),   # keyboard shell sold as "RAKK SINAG98 ... Case" (PHP rule)
+                    (r'\bpower ?bank\b', 'Power Bank'),
+                    (r'\b(cable|adapter|converter|hdmi|vga|displayport)\b', 'Cables'),   # 'usb hub' removed: PHP keeps it in Others
                     (r'\b(earphones?|earbuds?)\b', 'Earphones'),
                     (r'\b(mouse ?pad|gaming surface)\b', 'Gaming Surface'),
                     (r'\b(chair)\b', 'Chairs'), (r'\b(table|desk)\b', 'Tables')],
