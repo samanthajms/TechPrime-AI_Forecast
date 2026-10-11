@@ -45,6 +45,7 @@ import pandas as pd
 import xgboost as xgb
 import functools
 import category_alignment as ca
+from month_guard import drop_open_months
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -125,6 +126,7 @@ def _history():
     """Monthly PRODUCT history (with product names). Written by build_product_history.py (legacy POS)
     or by the live-DB rebuild job -- same columns either way."""
     h = pd.read_csv(HISTORY_PATH, dtype={'MSKU': str})
+    h = drop_open_months(h)                                        # the month in progress is partial: never the "latest actual"
     cutoff = history_cutoff()
     if cutoff:                                                     # demo / back-test: forecast as if `cutoff` were the latest month
         h = h[h['Month'] <= cutoff]

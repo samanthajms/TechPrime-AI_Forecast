@@ -11,6 +11,8 @@ Deployed on Render as a web service (see `render.yaml`). Security setup: [`docs/
 ## Data and the 80/20 split
 - Initial input: the historical POS export (2024-01 to 2026-08), already built into `preprocessed_monthly_features.csv` (per category, used for training) and `preprocessed_monthly_product_features.csv` (per product, read by the running service).
 - `rebuild_models_v2.py` splits **chronologically by month, 80% train / 20% test**, redrawn each run. Early stopping uses only the last train months, so the test months are never used for fitting or tuning.
+- Training only ever sees **closed months** (Asia/Manila; `month_guard.py`), never the `All` legacy bucket, and never a category's first 6 zero-padded months if it starts mid-file (`prepare_training_frame`). The forecast service applies the same closed-month rule to the history it forecasts from, so a month in progress can never be the "latest actual month".
+- Feature convention (all lags/rolling windows): **past months only** - a month's own sales are never part of its features. `rebuild_features_from_db.py` and `inventory_forecasting.py` use the same definition (pinned by a test against the committed CSV).
 - Test results feed `category_confidence.csv`, `revenue_category_confidence.csv`, `monthly_predictions.csv`, `revenue_predictions.csv` and `GET /api/metrics`.
 
 ## Date-range filter (optional `from` / `to`)
@@ -27,7 +29,7 @@ Unset it to return to normal. `GET /api/metrics` reports the active cutoff under
 ## Monthly retrain (automatic)
 `.github/workflows/monthly_retrain.yml` runs on the 2nd of every month (or manually: Actions -> Monthly retrain -> Run workflow, with an optional dry run):
 
-1. `rebuild_features_from_db.py` appends **closed months only** from the live database to both history files. It counts online orders in status `to_ship / to_receive / delivered / completed` plus completed cashier POS sales (voided, cancelled, unpaid and pending are ignored), buckets months in Asia/Manila, skips product categories the model has no code for (use `--allow-new-categories` to keep them), and opens the database connection **read-only**.
+1. `rebuild_features_from_db.py` appends **closed months only** from the live database to both history files. It only adds months *after* the last month already in the file; existing rows are never recomputed or reordered by value, and the closed-month filter is applied again after the append. It counts online orders in status `to_ship / to_receive / delivered / completed` plus completed cashier POS sales (voided, cancelled, unpaid and pending are ignored), buckets months in Asia/Manila, skips product categories the model has no code for (use `--allow-new-categories` to keep them), and opens the database connection **read-only**.
 2. `rebuild_models_v2.py` retrains on the chronological 80/20 split. The **regression gate is on by default**: if the new models are worse than the deployed ones nothing is overwritten and the job fails (exit 2). `--no-enforce-gate` overrides.
 3. Unit tests run (`python -m unittest discover -s tests -v`).
 4. The job opens a pull request `retrain/YYYY-MM` containing the new data + models and the gate report. **Merging it makes Render redeploy** with the new files - Render's disk is ephemeral, so models must live in git, not be retrained on the running service. Git history is the rollback (`git revert` the merge).

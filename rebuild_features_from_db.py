@@ -11,7 +11,7 @@ actually sold in the live system since the last run, on top of the existing
 file -- it does NOT throw away and rebuild from scratch.
 
 THIS MATTERS BECAUSE: the 26 months already in preprocessed_monthly_features.csv
-(2024-07 onward) came from an OLDER, separate POS system, used to originally
+(2024-07 to 2026-08) came from an OLDER, separate POS system, used to originally
 train/test the model, before TechPrime-AI's live orders table existed. The
 live `orders` table is newer and does not cover that same history. So this
 script treats the existing CSV as the historical foundation and only ADDS
@@ -19,25 +19,18 @@ months that come from real live orders and aren't already covered -- it never
 deletes or overwrites the old POS-era rows.
 
 WHAT IT DOES, STEP BY STEP:
-  1. Reads the CURRENT preprocessed_monthly_features.csv and keeps every row
-     already in it (the old POS history) untouched.
-  2. Connects to the same Postgres (Supabase) database the PHP app uses,
-     using the same .env file already sitting in this folder.
-  3. Asks the database: "for every month and every product category, how
-     many units sold and how much revenue came in?" -- this is the live data.
-  4. For each (category, month) combination in the live data: if that exact
-     month is already covered by the old file, the old file's row wins and
-     the live row is skipped (so POS history is never overwritten). If it's
-     a month the old file doesn't have, the live row is added.
-  5. Fills in any remaining gaps (a category with a month of zero sales still
-     needs a row of zeros -- the model expects an unbroken monthly timeline).
-  6. Re-calculates the lag/rolling-average columns (lag_1, roll_mean_3, etc.)
-     across the FULL combined timeline (old + newly added), so months near
-     the boundary between old and new data still get correct trend values.
-  7. Writes the combined result back to preprocessed_monthly_features.csv.
-  8. Keeps category_code_map.json in sync: if the database has a category
-     the model has never seen before, it's added with a new code instead of
-     silently crashing.
+  1. Reads the CURRENT preprocessed_monthly_features.csv. Every row already in it (the old POS history) is kept
+     EXACTLY as it is -- nothing is recomputed, so the warm-up history behind the first months is never lost.
+  2. Connects to the same Postgres (Supabase) database the PHP app uses, using the .env file in this folder.
+  3. Asks the database: "for every CLOSED month and every product category, how many units sold and how much revenue
+     came in?" (the month in progress is excluded in the SQL itself).
+  4. APPENDS only the months AFTER the last month already in the file. Months the file already has are never touched.
+  5. Fills gaps (a category with a month of zero sales gets a row of zeros -- the model needs an unbroken timeline).
+  6. Computes the lag / rolling features for the NEW rows only, from the months BEFORE each one (same convention as the
+     existing file and as inference in inventory_forecasting.py: the current month is never part of its own features).
+  7. Applies the closed-month filter once more on the combined result, so an unfinished month can never be in the file.
+  8. Keeps category_code_map.json in sync: if the database has a category the model has never seen, it is skipped
+     (or added with a new code under --allow-new-categories).
 
 WHEN TO RUN THIS:
   Monthly, after a calendar month closes -- e.g. run it on the 1st for the
@@ -70,6 +63,8 @@ import pandas as pd
 import psycopg2
 from dotenv import load_dotenv
 import os
+
+from month_guard import drop_open_months
 
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / '.env')
@@ -108,18 +103,14 @@ OUTPUT_COLUMNS = [
 
 
 # -----------------------------------------------------------------
-# Step 1a: load the EXISTING file -- this is the POS-era historical
-# foundation that must never be overwritten or dropped.
+# Step 1a: load the EXISTING file -- the pre-initialized history (2024-07 to 2026-08). It is kept verbatim: its rows are
+# never recomputed, reordered by value or dropped, because their lag columns were built with months (2024-01..06) that
+# are no longer in the file and could not be rebuilt from it.
 # -----------------------------------------------------------------
-def load_existing_base() -> pd.DataFrame:
+def load_existing_features() -> pd.DataFrame:
     if not FEATURES_PATH.exists():
-        return pd.DataFrame(columns=['category', 'month', 'units_sold', 'revenue', 'avg_price'])
-
-    old = pd.read_csv(FEATURES_PATH)
-    old = old[old['Category'] != 'All']  # the aggregate row is recomputed fresh, not carried over
-    old = old.rename(columns={'Category': 'category', 'Month': 'month'})
-    old['month'] = pd.PeriodIndex(old['month'], freq='M')
-    return old[['category', 'month', 'units_sold', 'revenue', 'avg_price']].copy()
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    return pd.read_csv(FEATURES_PATH)[OUTPUT_COLUMNS]
 
 
 # -----------------------------------------------------------------
@@ -211,111 +202,74 @@ def merge_product_history(existing: pd.DataFrame, live: pd.DataFrame) -> pd.Data
 
 
 # -----------------------------------------------------------------
-# Step 2: merge -- old POS-era rows always win; live rows are only
-# added for (category, month) pairs the old file doesn't already have.
+# Step 2: features for ONE new month, from the months before it.
+# Same convention as the existing file and as _build_demand_features/_build_revenue_features in
+# inventory_forecasting.py: lags and rolling windows only look at PAST months, never at the month being described.
+# (A window that includes the month itself leaks the answer into the features and the test score looks better than the
+# model really is.)
 # -----------------------------------------------------------------
-def merge_base(old: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
-    old = old.copy()
-    old['source'] = 'pos_history'
-    live = live.copy()
-    live['source'] = 'live_orders'
-
-    combined = pd.concat([old, live], ignore_index=True)
-    before = len(combined)
-    # old rows are listed first, so keep='first' means POS history always wins on a clash
-    combined = combined.drop_duplicates(subset=['category', 'month'], keep='first')
-    skipped = before - len(combined)
-
-    added_live = combined[combined['source'] == 'live_orders']
-    print(f"POS-history rows kept as-is: {len(old)}")
-    print(f"Live months skipped because that month already exists in POS history: {skipped}")
-    print(f"New months added from live orders: {len(added_live)}"
-          + (f" ({added_live['month'].min()} to {added_live['month'].max()})" if not added_live.empty else ""))
-
-    return combined.drop(columns='source')
-
-
-# -----------------------------------------------------------------
-# Step 3: fill gaps so every category has one row per month, even
-# months where nothing sold (the model needs an unbroken timeline)
-# -----------------------------------------------------------------
-def build_full_grid(monthly: pd.DataFrame) -> pd.DataFrame:
-    all_months = pd.period_range(monthly['month'].min(), monthly['month'].max(), freq='M')
-    categories = sorted(monthly['category'].unique())
-
-    grid = pd.MultiIndex.from_product([categories, all_months], names=['category', 'month']).to_frame(index=False)
-    merged = grid.merge(monthly, on=['category', 'month'], how='left')
-    merged['units_sold'] = merged['units_sold'].fillna(0)
-    merged['revenue'] = merged['revenue'].fillna(0)
-
-    merged['avg_price'] = np.where(merged['units_sold'] > 0, merged['revenue'] / merged['units_sold'], np.nan)
-    # a month with zero sales still needs a plausible price for the lag features -- carry the nearest known price
-    merged['avg_price'] = merged.groupby('category')['avg_price'].transform(lambda s: s.ffill().bfill())
-
-    # add an "All" row per month too, matching the existing CSV's aggregate total category
-    totals = merged.groupby('month', as_index=False).agg(units_sold=('units_sold', 'sum'), revenue=('revenue', 'sum'))
-    totals['category'] = 'All'
-    totals['avg_price'] = np.where(totals['units_sold'] > 0, totals['revenue'] / totals['units_sold'], np.nan)
-    totals['avg_price'] = totals['avg_price'].ffill().bfill()
-
-    return pd.concat([merged, totals[merged.columns]], ignore_index=True).sort_values(['category', 'month'])
+def next_month_features(units, revenue, price) -> dict:
+    """Features for the month that follows the given history (oldest first, same length)."""
+    n = len(units)
+    last = lambda arr, k: float(arr[-k]) if n >= k else 0.0                 # noqa: E731
+    u3, r3, p3 = units[-3:], revenue[-3:], price[-3:]
+    price_trend = (price[-1] - price[-4]) / price[-4] if n >= 4 and price[-4] else 0.0
+    return {
+        'lag_1': last(units, 1), 'lag_2': last(units, 2), 'lag_3': last(units, 3),
+        'lag_12': last(units, 12) if n >= 12 else last(units, 3),            # inference falls back to lag_3
+        'roll_mean_3': float(np.mean(u3)) if n else 0.0,
+        'roll_mean_6': float(np.mean(units[-6:])) if n else 0.0,
+        'roll_std_3': float(np.std(u3, ddof=1)) if len(u3) > 1 else 0.0,
+        'avg_price_lag_1': float(price[-1]) if n else 0.0,
+        'avg_price_roll_mean_3': float(np.mean(p3)) if n else 0.0,
+        'price_trend': float(price_trend),
+        'revenue_lag_1': last(revenue, 1),
+        'revenue_lag_12': last(revenue, 12) if n >= 12 else last(revenue, 1),
+        'revenue_roll_mean_3': float(np.mean(r3)) if n else 0.0,
+        'revenue_roll_mean_6': float(np.mean(revenue[-6:])) if n else 0.0,
+    }
 
 
 # -----------------------------------------------------------------
-# Step 3: compute the lag / rolling-average feature columns
-# (same formulas as _build_demand_features / _build_revenue_features
-# in inventory_forecasting.py, applied across the whole history instead
-# of just "the next month")
+# Step 3: APPEND the live months that come after the file's last month. Existing rows are never touched.
 # -----------------------------------------------------------------
-def add_features(full: pd.DataFrame) -> pd.DataFrame:
-    out_rows = []
-    for cat, g in full.groupby('category', sort=False):
-        g = g.sort_values('month').reset_index(drop=True)
-        units = g['units_sold'].values
-        revenue = g['revenue'].values
-        price = g['avg_price'].values
+def append_live_months(existing: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
+    """New rows only (OUTPUT_COLUMNS, no category_code yet). `live` has columns category, month (Period), units_sold,
+    revenue. Every category gets a row for every new month (zeros when nothing sold) so the timeline stays unbroken."""
+    base = existing[existing['Category'] != 'All']      # 'All' is a legacy junk bucket (negative revenue), not a category
+    last_month = pd.Period(base['Month'].max(), freq='M') if not base.empty else None
+    live = live[live['month'] > last_month] if last_month is not None else live
+    if live.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-        for i in range(len(g)):
-            def lag(arr, k):
-                return arr[i - k] if i - k >= 0 else 0
-
-            lag_1, lag_2, lag_3, lag_12 = lag(units, 1), lag(units, 2), lag(units, 3), lag(units, 12)
-            window3 = units[max(0, i - 2):i + 1]
-            window6 = units[max(0, i - 5):i + 1]
-            roll_mean_3 = float(np.mean(window3))
-            roll_mean_6 = float(np.mean(window6))
-            roll_std_3 = float(np.std(window3, ddof=1)) if len(window3) > 1 else 0.0
-
-            r_lag_1 = lag(revenue, 1)
-            r_lag_12 = lag(revenue, 12) if i - 12 >= 0 else r_lag_1
-            r_window3 = revenue[max(0, i - 2):i + 1]
-            r_window6 = revenue[max(0, i - 5):i + 1]
-            revenue_roll_mean_3 = float(np.mean(r_window3))
-            revenue_roll_mean_6 = float(np.mean(r_window6))
-
-            p_lag_1 = lag(price, 1) if i - 1 >= 0 else price[i]
-            p_window3 = price[max(0, i - 2):i + 1]
-            avg_price_roll_mean_3 = float(np.mean(p_window3))
-            p_lag_4 = lag(price, 4) if i - 4 >= 0 else None
-            price_trend = ((p_lag_1 - p_lag_4) / p_lag_4) if p_lag_4 else 0.0
-
-            month_period = g['month'].iloc[i]
-            out_rows.append({
-                'Month': str(month_period),
-                'Category': cat,
-                'units_sold': int(units[i]),
-                'revenue': round(float(revenue[i]), 2),
-                'avg_price': round(float(price[i]), 2) if not np.isnan(price[i]) else 0.0,
-                'lag_1': int(lag_1), 'lag_2': int(lag_2), 'lag_3': int(lag_3), 'lag_12': int(lag_12),
-                'roll_mean_3': roll_mean_3, 'roll_mean_6': roll_mean_6, 'roll_std_3': roll_std_3,
-                'avg_price_lag_1': round(float(p_lag_1), 2), 'avg_price_roll_mean_3': round(avg_price_roll_mean_3, 2),
-                'price_trend': round(price_trend, 4),
-                'revenue_lag_1': round(float(r_lag_1), 2), 'revenue_lag_12': round(float(r_lag_12), 2),
-                'revenue_roll_mean_3': round(revenue_roll_mean_3, 2), 'revenue_roll_mean_6': round(revenue_roll_mean_6, 2),
-                'month_num': month_period.month, 'quarter': month_period.quarter,
+    new_months = pd.period_range(live['month'].min(), live['month'].max(), freq='M')
+    categories = sorted(set(base['Category']) | set(live['category']))
+    sales = live.set_index(['category', 'month'])
+    rows = []
+    for cat in categories:
+        hist = base[base['Category'] == cat].sort_values('Month')
+        units = [float(x) for x in hist['units_sold']]
+        revenue = [float(x) for x in hist['revenue']]
+        price = [float(x) for x in hist['avg_price']]
+        for month in new_months:
+            feats = next_month_features(units, revenue, price)
+            u, r = (float(sales.at[(cat, month), 'units_sold']), float(sales.at[(cat, month), 'revenue'])) \
+                if (cat, month) in sales.index else (0.0, 0.0)
+            u = float(round(u))
+            p = (r / u) if u > 0 else (price[-1] if price else 0.0)   # a zero-sales month carries the last known price
+            rows.append({
+                'Month': str(month), 'Category': cat, 'units_sold': int(u), 'revenue': round(r, 2), 'avg_price': round(p, 2),
+                'lag_1': int(feats['lag_1']), 'lag_2': int(feats['lag_2']), 'lag_3': int(feats['lag_3']),
+                'lag_12': int(feats['lag_12']), 'roll_mean_3': feats['roll_mean_3'], 'roll_mean_6': feats['roll_mean_6'],
+                'roll_std_3': feats['roll_std_3'], 'avg_price_lag_1': round(feats['avg_price_lag_1'], 2),
+                'avg_price_roll_mean_3': round(feats['avg_price_roll_mean_3'], 2), 'price_trend': round(feats['price_trend'], 4),
+                'revenue_lag_1': round(feats['revenue_lag_1'], 2), 'revenue_lag_12': round(feats['revenue_lag_12'], 2),
+                'revenue_roll_mean_3': round(feats['revenue_roll_mean_3'], 2),
+                'revenue_roll_mean_6': round(feats['revenue_roll_mean_6'], 2),
+                'month_num': month.month, 'quarter': month.quarter,
             })
-
-    return pd.DataFrame(out_rows)
+            units.append(u); revenue.append(r); price.append(p)
+    return pd.DataFrame(rows).reindex(columns=[c for c in OUTPUT_COLUMNS if c != 'category_code'])
 
 
 # -----------------------------------------------------------------
@@ -357,45 +311,43 @@ def main():
                         help="Keep product categories the models have no code for (they get a new code).")
     args = parser.parse_args()
 
-    print("Reading existing POS-era historical data (kept as-is, never overwritten)...")
-    old_base = load_existing_base()
+    print("Reading the pre-initialized history (kept verbatim, never recomputed)...")
+    existing = load_existing_features()
 
     print("Connecting to the database and pulling closed-month sales (counted orders + completed POS sales)...")
-    live_base = filter_known_categories(fetch_monthly_sales(), 'category', args.allow_new_categories)
+    live = filter_known_categories(fetch_monthly_sales(), 'category', args.allow_new_categories)
 
-    print("Merging: POS history stays fixed, only genuinely new live months are added...")
-    monthly = merge_base(old_base, live_base)
-
-    print("Filling in months with zero sales so every category has an unbroken timeline...")
-    full = build_full_grid(monthly)
-
-    print("Calculating lag / rolling-average features...")
-    featured = add_features(full)
+    print("Appending only the live months after the file's last month...")
+    new_rows = append_live_months(existing, live)
 
     print("Checking for any new categories not yet known to the model...")
     if args.dry_run:
         # sync_category_codes writes category_code_map.json when it finds a new category; keep dry runs read-only
         original_map = CATEGORY_MAP_PATH.read_bytes() if CATEGORY_MAP_PATH.exists() else None
-    sync_category_codes(featured)
+    if not new_rows.empty:
+        sync_category_codes(new_rows)
+    else:
+        new_rows['category_code'] = pd.Series(dtype=int)
     if args.dry_run:
         if original_map is None:
             CATEGORY_MAP_PATH.unlink(missing_ok=True)
         else:
             CATEGORY_MAP_PATH.write_bytes(original_map)
 
-    featured = featured[OUTPUT_COLUMNS].sort_values(['Category', 'Month']).reset_index(drop=True)
+    # Closed-month filter, applied AFTER the append so the combined file can never end on an unfinished month.
+    combined = pd.concat([existing, new_rows[OUTPUT_COLUMNS]], ignore_index=True)
+    featured = drop_open_months(combined).sort_values(['Category', 'Month']).reset_index(drop=True)
+    dropped = len(combined) - len(featured)
+    if dropped:
+        print(f"Dropped {dropped} row(s) belonging to the month in progress.")
 
     print("Topping up the per-product history the running service reads...")
     prod_existing = pd.read_csv(PRODUCT_HISTORY_PATH, dtype={'MSKU': str}) if PRODUCT_HISTORY_PATH.exists() else pd.DataFrame()
     prod_live = filter_known_categories(fetch_monthly_product_sales(), 'category', args.allow_new_categories)
-    prod_new = merge_product_history(prod_existing, prod_live)
+    prod_new = drop_open_months(merge_product_history(prod_existing, prod_live))
 
-    old_rows = 0
-    if FEATURES_PATH.exists():
-        old_rows = sum(1 for _ in open(FEATURES_PATH)) - 1
-
-    print(f"\nCategory file: {old_rows} -> {len(featured)} rows, categories: {featured['Category'].nunique()}, "
-          f"months: {featured['Month'].min()} to {featured['Month'].max()}")
+    print(f"\nCategory file: {len(existing)} -> {len(featured)} rows ({len(new_rows)} appended), "
+          f"categories: {featured['Category'].nunique()}, months: {featured['Month'].min()} to {featured['Month'].max()}")
     print(f"Product file:  {len(prod_existing)} -> {len(prod_new)} rows, last month: {prod_new['Month'].max()}")
 
     if args.dry_run:

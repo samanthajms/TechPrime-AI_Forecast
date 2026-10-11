@@ -19,7 +19,8 @@ DESIGN (matches the "80/20 gate vs. ongoing accuracy log" plan):
      independently of this script and is never overwritten by a retrain.
 
 WHAT THIS SCRIPT DOES:
-  - Loads preprocessed_monthly_features.csv (swap for a real feature-build
+  - Loads preprocessed_monthly_features.csv, keeping only closed months with enough history (prepare_training_frame)
+    (swap for a real feature-build
     query in production, same as `_load_transactions()` in
     inventory_forecasting.py)
   - Splits chronologically: first 80% of available months = train,
@@ -60,6 +61,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from month_guard import drop_open_months
+
 BASE_DIR = Path(__file__).parent
 
 FEATURES_PATH = BASE_DIR / 'preprocessed_monthly_features.csv'
@@ -77,6 +80,27 @@ REVENUE_FEATURES = ['revenue_lag_1', 'revenue_lag_12', 'revenue_roll_mean_3', 'r
                      'month_num', 'quarter', 'category_code']
 
 TRAIN_FRACTION = 0.8  # 80/20 -- redrawn fresh every run, not a fixed historical slice
+
+NON_TRAINING_CATEGORIES = {'All'}   # legacy POS bucket (units 0-2, negative revenue): not a product category
+MIN_HISTORY_MONTHS = 6              # months of past sales a row needs before its lag/rolling features mean anything
+
+
+def prepare_training_frame(df, now=None):
+    """What the models may learn from, and nothing else:
+      1. no month in progress (its sales are partial, so it would teach the model a fake slump) -- applied last
+         of all, after any rows were appended;
+      2. no junk categories;
+      3. no row without enough history behind it: a category that only starts mid-file has zero-padded lags for its
+         first MIN_HISTORY_MONTHS months. Categories present from the first month of the file are pre-initialized
+         rows whose lags were built from earlier months that are no longer in the file, so they stay."""
+    df = drop_open_months(df, now=now)
+    df = df[~df['Category'].isin(NON_TRAINING_CATEGORIES)].copy()
+    df['Month'] = pd.PeriodIndex(df['Month'].astype(str), freq='M')
+    file_start = df['Month'].min()
+    first_seen = df.groupby('Category')['Month'].transform('min')
+    age = (df['Month'] - first_seen).apply(lambda d: d.n)
+    keep = (first_seen == file_start) | (age >= MIN_HISTORY_MONTHS)
+    return df[keep]
 
 
 def _chronological_split(df, train_fraction=TRAIN_FRACTION):
@@ -170,6 +194,7 @@ ARTIFACTS = [DEMAND_MODEL_PATH, REVENUE_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, RE
 
 
 def _overall_rel_error(conf_df):
+    conf_df = conf_df.drop(index=[c for c in NON_TRAINING_CATEGORIES if c in conf_df.index])   # deployed tables may still list 'All'
     mean_actual = conf_df['avg_actual'].replace(0, np.nan).mean()
     return float(conf_df['rmse'].mean() / mean_actual)
 
@@ -214,8 +239,7 @@ def main():
                          help="Chronological train fraction. Default 0.8 (80/20).")
     args = parser.parse_args()
 
-    df = pd.read_csv(FEATURES_PATH)
-    df['Month'] = pd.PeriodIndex(df['Month'], freq='M')
+    df = prepare_training_frame(pd.read_csv(FEATURES_PATH))
 
     train_df, test_df, train_months, test_months = _chronological_split(df, args.train_fraction)
     print(f"Chronological split (redrawn this run): "

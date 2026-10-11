@@ -132,5 +132,92 @@ class Pipeline(unittest.TestCase):
         self.assertNotIn("to_pay", r.COUNTED_ORDER_STATUSES)
 
 
+class LiveAppend(unittest.TestCase):
+    """The monthly top-up: existing rows untouched, new months appended with past-only features, open month excluded."""
+    FEATS = ["lag_1", "lag_2", "lag_3", "lag_12", "roll_mean_3", "roll_mean_6", "roll_std_3", "avg_price_lag_1",
+             "avg_price_roll_mean_3", "price_trend", "revenue_lag_1", "revenue_lag_12", "revenue_roll_mean_3",
+             "revenue_roll_mean_6"]
+
+    def test_features_match_the_committed_csv_convention(self):
+        """next_month_features on the months before a row must reproduce that row's stored features (>=12 months in)."""
+        import pandas as pd
+        import rebuild_features_from_db as r
+        f = pd.read_csv(ROOT / "preprocessed_monthly_features.csv")
+        f = f[f.Category != "All"]
+        checked = 0
+        for _, g in f.groupby("Category"):
+            g = g.sort_values("Month").reset_index(drop=True)
+            for i in range(12, len(g)):
+                got = r.next_month_features(list(g.units_sold[:i]), list(g.revenue[:i]), list(g.avg_price[:i]))
+                for k in self.FEATS:
+                    self.assertAlmostEqual(got[k], g.loc[i, k], delta=0.02 + abs(g.loc[i, k]) * 1e-3, msg=f"{k} {g.Category[i]} {g.Month[i]}")
+                checked += 1
+        self.assertGreater(checked, 300)
+
+    def _existing(self):
+        import pandas as pd
+        import rebuild_features_from_db as r
+        return pd.read_csv(ROOT / "preprocessed_monthly_features.csv")[r.OUTPUT_COLUMNS]
+
+    def test_append_keeps_old_rows_and_only_adds_later_months(self):
+        import pandas as pd
+        import rebuild_features_from_db as r
+        existing = self._existing()
+        last = existing[existing.Category != "All"].Month.max()
+        live = pd.DataFrame({"category": ["MEMORY", "MEMORY", "MOUSE"],
+                             "month": pd.PeriodIndex([last, "2026-09", "2026-09"], freq="M"),
+                             "units_sold": [999.0, 10.0, 4.0], "revenue": [999.0, 1000.0, 400.0]})
+        new = r.append_live_months(existing, live)
+        self.assertEqual(set(new.Month), {"2026-09"})                             # the clashing old month is not re-added
+        self.assertEqual(set(new.Category), set(existing[existing.Category != "All"].Category))   # zeros for the rest
+        mem = new[new.Category == "MEMORY"].iloc[0]
+        self.assertEqual((mem.units_sold, mem.revenue), (10, 1000.0))
+        prev = existing[(existing.Category == "MEMORY")].sort_values("Month")
+        self.assertEqual(mem.lag_1, prev.units_sold.iloc[-1])                      # lags come from the real last month
+        self.assertEqual(new[new.Category == "ACCESSORIES"].iloc[0].units_sold, 0)
+
+    def test_features_ignore_the_month_they_describe(self):
+        import pandas as pd
+        import rebuild_features_from_db as r
+        existing = self._existing()
+        def run(units):
+            live = pd.DataFrame({"category": ["MEMORY"], "month": pd.PeriodIndex(["2026-09"], freq="M"),
+                                 "units_sold": [units], "revenue": [units * 100.0]})
+            return r.append_live_months(existing, live).query("Category == 'MEMORY'").iloc[0]
+        a, b = run(1.0), run(500.0)
+        for k in self.FEATS:
+            self.assertEqual(a[k], b[k], k)                                       # no leakage of the month's own sales
+
+    def test_open_month_is_dropped_after_the_append(self):
+        import pandas as pd
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from month_guard import drop_open_months
+        now = datetime(2026, 10, 11, 9, 0, tzinfo=ZoneInfo("Asia/Manila"))
+        df = pd.DataFrame({"Month": ["2026-08", "2026-09", "2026-10", "2026-11"], "v": [1, 2, 3, 4]})
+        self.assertEqual(list(drop_open_months(df, now=now).Month), ["2026-08", "2026-09"])
+        # 2026-09-30 17:00 UTC is already 2026-10-01 in Manila -> September is closed there
+        edge = datetime(2026, 9, 30, 17, 0, tzinfo=ZoneInfo("UTC"))
+        self.assertEqual(list(drop_open_months(df, now=edge).Month), ["2026-08", "2026-09"])
+
+
+class TrainingFrame(unittest.TestCase):
+    def test_open_month_junk_category_and_short_history_are_not_trained_on(self):
+        import pandas as pd
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import rebuild_models_v2 as m
+        months = [str(p) for p in pd.period_range("2025-01", "2026-10", freq="M")]
+        rows = [{"Month": mo, "Category": "MEMORY"} for mo in months]
+        rows += [{"Month": mo, "Category": "All"} for mo in months]
+        rows += [{"Month": mo, "Category": "NEWCAT"} for mo in months[3:]]          # starts mid-file
+        now = datetime(2026, 10, 11, tzinfo=ZoneInfo("Asia/Manila"))
+        out = m.prepare_training_frame(pd.DataFrame(rows), now=now)
+        self.assertNotIn("All", set(out.Category))
+        self.assertEqual(str(out.Month.max()), "2026-09")                            # October is in progress
+        self.assertEqual(len(out[out.Category == "MEMORY"]), 21)                     # present from the file's first month: all closed months kept
+        self.assertEqual(str(out[out.Category == "NEWCAT"].Month.min()), "2025-10")  # began 2025-04: its 6 zero-padded months are skipped
+
+
 if __name__ == "__main__":
     unittest.main()
