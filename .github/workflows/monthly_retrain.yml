@@ -69,7 +69,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B "$branch"
           git add preprocessed_monthly_features.csv preprocessed_monthly_product_features.csv category_code_map.json \
-                  xgb_monthly_demand_model.json xgb_monthly_revenue_model.json \
+                  xgb_monthly_demand_model.json \
                   category_confidence.csv revenue_category_confidence.csv monthly_predictions.csv revenue_predictions.csv model_accuracy.json
           if git diff --cached --quiet; then echo "Nothing changed - no PR."; exit 0; fi
           git commit -m "Monthly retrain ${month}"

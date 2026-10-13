@@ -4,15 +4,14 @@ inventory_forecasting.py
 Drop-in module for integrating the monthly XGBoost demand + revenue
 forecasting models into an inventory system.
 
-TWO SEPARATE MODELS (not one derived from the other):
-  - Demand model  -> predicts units_sold per category/month
-  - Revenue model -> predicts revenue (PHP) per category/month directly,
-    using its own price-based features (avg price, price trend), so it can
-    learn revenue-specific patterns that units alone can't capture. See the
-    "TechPrime AI alignment" conversation for why these are kept separate
-    rather than derived (units x price) -- some categories (e.g. Memory,
-    Solid State Drive) have real price volatility that a derived number
-    would miss.
+ONE LEARNED MODEL, REVENUE DERIVED FROM IT:
+  - Demand model  -> XGBoost, predicts units_sold per category/month
+  - Revenue       -> predicted units x expected unit price, where the expected price is the mean of the category's last
+    PRICE_WINDOW (3) monthly average prices, held flat over the horizon. A separate XGBoost revenue model was retired:
+    on the held-out months it scored 35.0% WAPE (285% on the lower-volume half of the categories) against 18.7% for this
+    derivation, and its month-by-month recursion compounded errors (a small category forecast at 15x its real revenue).
+    Price changes are therefore not predicted, only carried forward; the confidence band comes from the held-out error
+    of this same derivation (revenue_category_confidence.csv).
 
 PRODUCT-LEVEL FORECASTING (top-down allocation, not a separate model):
   438 products is too sparse per-SKU to train reliable individual models --
@@ -44,6 +43,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import functools
+import abc_classification as abc
 import accuracy_metrics as am
 import category_alignment as ca
 from dotenv import load_dotenv
@@ -54,7 +54,6 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 
 DEMAND_MODEL_PATH = BASE_DIR / 'xgb_monthly_demand_model.json'
-REVENUE_MODEL_PATH = BASE_DIR / 'xgb_monthly_revenue_model.json'
 CATEGORY_MAP_PATH = BASE_DIR / 'category_code_map.json'
 CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
@@ -63,9 +62,7 @@ HISTORY_PATH = Path(os.environ.get('HISTORY_PATH', BASE_DIR / 'preprocessed_mont
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
-REVENUE_FEATURES = ['revenue_lag_1', 'revenue_lag_12', 'revenue_roll_mean_3', 'revenue_roll_mean_6',
-                     'avg_price_lag_1', 'avg_price_roll_mean_3', 'price_trend',
-                     'month_num', 'quarter', 'category_code']
+PRICE_WINDOW = 3          # months of average price behind the expected unit price (same column as avg_price_roll_mean_3)
 
 # -----------------------------------------------------------------
 # Load models + supporting artifacts once at import time
@@ -80,25 +77,23 @@ def check_horizon(horizon):
     return horizon
 
 
-_demand_model = _revenue_model = None
+_demand_model = None
 CATEGORY_CODE_MAP = {}
 _cat_confidence = _revenue_confidence = None
 
 
 def reload_models():
-    """(Re)load the trained models, category codes and confidence tables from disk. Called at import and again after a
+    """(Re)load the trained demand model, category codes and confidence tables from disk. Called at import and again after a
     monthly retrain so the running process picks up the new artifacts without a restart. Everything is loaded first and
     swapped in together, so a half-written file can never leave the module in a mixed state."""
-    global _demand_model, _revenue_model, CATEGORY_CODE_MAP, _cat_confidence, _revenue_confidence
+    global _demand_model, CATEGORY_CODE_MAP, _cat_confidence, _revenue_confidence
     demand = xgb.XGBRegressor()
     demand.load_model(str(DEMAND_MODEL_PATH))
-    revenue = xgb.XGBRegressor()
-    revenue.load_model(str(REVENUE_MODEL_PATH))
     with open(CATEGORY_MAP_PATH) as f:
         code_map = json.load(f)
     cat_conf = pd.read_csv(CATEGORY_CONFIDENCE_PATH).set_index('Category')
     rev_conf = pd.read_csv(REVENUE_CONFIDENCE_PATH).set_index('Category')
-    _demand_model, _revenue_model, CATEGORY_CODE_MAP = demand, revenue, code_map
+    _demand_model, CATEGORY_CODE_MAP = demand, code_map
     _cat_confidence, _revenue_confidence = cat_conf, rev_conf
 
 
@@ -152,7 +147,7 @@ def _history():
 def reload_history():
     """Reload the models and history after a retrain / data refresh and drop every cache that depends on them."""
     reload_models()
-    _history.cache_clear(); _product_shares.cache_clear(); _product_forecast.cache_clear()
+    _history.cache_clear(); _product_shares.cache_clear(); _product_forecast.cache_clear(); _abc.cache_clear()
     get_model_metrics.cache_clear(); ca.reload_map()
 
 
@@ -252,30 +247,13 @@ def _build_demand_features(series_df):
     return feats, next_month
 
 
-def _build_revenue_features(series_df):
-    """Returns feature dict for the NEXT month's revenue prediction."""
-    rev = series_df['revenue'].values
-    price = series_df['avg_price'].values
-    if len(rev) < 4:
-        raise ValueError("Need at least 4 months of history to build revenue features.")
-
-    def safe(arr, k):
-        return arr[-k] if len(arr) >= k else np.nan
-
-    revenue_lag_1 = safe(rev, 1)
-    revenue_lag_12 = safe(rev, 12) if len(rev) >= 12 else revenue_lag_1
-    revenue_roll_mean_3 = np.mean(rev[-3:])
-    revenue_roll_mean_6 = np.mean(rev[-6:]) if len(rev) >= 6 else np.mean(rev)
-    avg_price_lag_1 = safe(price, 1)
-    avg_price_roll_mean_3 = np.mean(price[-3:])
-    price_trend = ((safe(price, 1) - safe(price, 4)) / safe(price, 4)) if len(price) >= 4 and safe(price, 4) else 0.0
-
-    next_month = series_df['Month'].iloc[-1] + 1
-    feats = {'revenue_lag_1': revenue_lag_1, 'revenue_lag_12': revenue_lag_12,
-             'revenue_roll_mean_3': revenue_roll_mean_3, 'revenue_roll_mean_6': revenue_roll_mean_6,
-             'avg_price_lag_1': avg_price_lag_1, 'avg_price_roll_mean_3': avg_price_roll_mean_3,
-             'price_trend': price_trend, 'month_num': next_month.month, 'quarter': next_month.quarter}
-    return feats, next_month
+def expected_unit_price(series_df, window=PRICE_WINDOW):
+    """Expected unit price for the coming months: mean of the last `window` monthly average prices (the same definition
+    the retrain uses for avg_price_roll_mean_3, so training and serving agree). Held flat over the whole horizon."""
+    price = series_df['avg_price'].dropna().values
+    if len(price) == 0:
+        raise ValueError("No price history for this category.")
+    return float(np.mean(price[-window:]))
 
 
 # -----------------------------------------------------------------
@@ -292,8 +270,8 @@ def get_forecast(category=None, product=None, horizon=1):
         of category volume (top-down allocation -- see module docstring for why
         products are NOT individually modeled).
 
-    Both the demand model and the revenue model are run independently (NOT
-    revenue = units x price) -- see module docstring.
+    Demand comes from the XGBoost demand model; revenue is predicted units x the expected unit price (see module
+    docstring for why the separate revenue model was retired).
 
     Returns: list of dicts, one per forecasted month:
         [{'month': 'YYYY-MM',
@@ -315,6 +293,7 @@ def get_forecast(category=None, product=None, horizon=1):
 
     demand_series = _monthly_series(cat)[['Month', 'units_sold']].copy()
     revenue_series = _monthly_series(cat)[['Month', 'revenue', 'avg_price']].copy()
+    unit_price = expected_unit_price(revenue_series)             # flat over the horizon: nothing is fed back
 
     demand_rmse = float(_cat_confidence.loc[cat, 'rmse']) if cat in _cat_confidence.index else float(demand_series['units_sold'].std())
     revenue_rmse = float(_revenue_confidence.loc[cat, 'rmse']) if cat in _revenue_confidence.index else float(revenue_series['revenue'].std())
@@ -328,11 +307,8 @@ def get_forecast(category=None, product=None, horizon=1):
         units_pred = float(np.clip(_demand_model.predict(Xd)[0], 0, None))
         d_band = demand_rmse * (1 + 0.3 * (step - 1))
 
-        # --- revenue model ---
-        r_feats, _ = _build_revenue_features(revenue_series)
-        r_feats['category_code'] = cat_code
-        Xr = pd.DataFrame([r_feats])[REVENUE_FEATURES]
-        revenue_pred = float(np.clip(_revenue_model.predict(Xr)[0], 0, None))
+        # --- revenue = predicted units x expected unit price ---
+        revenue_pred = units_pred * unit_price
         r_band = revenue_rmse * (1 + 0.3 * (step - 1))
 
         row = {
@@ -359,12 +335,9 @@ def get_forecast(category=None, product=None, horizon=1):
 
         results.append(row)
 
-        # feed predictions back in as if observed, for the next recursive step
+        # feed the demand prediction back in as if observed, for the next recursive step
         demand_series = pd.concat([demand_series, pd.DataFrame(
             [{'Month': next_month, 'units_sold': units_pred}])], ignore_index=True)
-        implied_price = revenue_pred / units_pred if units_pred > 0 else revenue_series['avg_price'].iloc[-1]
-        revenue_series = pd.concat([revenue_series, pd.DataFrame(
-            [{'Month': next_month, 'revenue': revenue_pred, 'avg_price': implied_price}])], ignore_index=True)
 
     return results
 
@@ -571,6 +544,55 @@ def _in_range(h, start=None, end=None):
     return h
 
 
+def _pct(new, old):
+    """Percentage change of `new` over `old`; None when `old` is not positive (growth from nothing is undefined)."""
+    return round((float(new) / float(old) - 1) * 100, 1) if old is not None and old > 0 else None
+
+
+def _actual_months(h):
+    """(latest actual month, month before it) as 'YYYY-MM' strings, taken from the WHOLE history so a from/to display
+    range never changes a growth figure."""
+    last = _history()['Month'].max()
+    return last, str(pd.Period(last, freq='M') - 1)
+
+
+def _month_base(h, last, keys):
+    """{key: (units, revenue)} sold in the latest actual month, per `keys` column (or {'': ...} for the selection)."""
+    cur = h[h['Month'] == last]
+    if not keys:
+        return {'': (float(cur['units_sold'].sum()), float(cur['revenue'].sum()))}
+    g = cur.groupby(keys)[['units_sold', 'revenue']].sum()
+    return {k: (float(r.units_sold), float(r.revenue)) for k, r in g.iterrows()}
+
+
+def _with_mom(rows, base):
+    """Add month-over-month growth to one key's forecast rows (sorted by month): the first forecast month is compared
+    with the latest ACTUAL month, each later one with the forecast month before it. base = (units, revenue) of that actual month."""
+    pu, pr = base
+    out = []
+    for r in rows:
+        out.append({**r, 'units_mom_pct': _pct(r['predicted_units'], pu), 'revenue_mom_pct': _pct(r['predicted_revenue'], pr)})
+        pu, pr = r['predicted_units'], r['predicted_revenue']
+    return out
+
+
+def _growth_block(h):
+    """MoM summary of ACTUAL sales for a selection: latest closed month vs the month before it."""
+    last, prev = _actual_months(h)
+    by = h.groupby('Month')[['units_sold', 'revenue']].sum()
+    u = lambda m: float(by['units_sold'].get(m, 0)); r = lambda m: float(by['revenue'].get(m, 0))
+    return {'basis': 'month-over-month (closed calendar months)',
+            'last_actual_month': last, 'previous_month': prev,
+            'last_actual_units': round(u(last), 1), 'last_actual_revenue': round(r(last), 2),
+            'previous_units': round(u(prev), 1), 'previous_revenue': round(r(prev), 2),
+            'units_mom_pct': _pct(u(last), u(prev)), 'revenue_mom_pct': _pct(r(last), r(prev))}
+
+
+def _total_with_mom(df, h_all):
+    rows = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()]
+    return _with_mom(rows, _month_base(h_all, _actual_months(h_all)[0], [])[''])
+
+
 def get_revenue_forecast(horizon=3, category=None, start=None, end=None):
     """Sales/Revenue screen. `category` may be a shop label, shop group, or 'model:X'. Returns the total for the
     selection, a breakdown by shop category and by shop group, and the monthly history for the chart.
@@ -585,25 +607,70 @@ def get_revenue_forecast(horizon=3, category=None, start=None, end=None):
                     kind, val)
     else:
         h = h.rename(columns={'Shop Category': 'category', 'Shop Group': 'shop_group', 'Category': 'model_category'})
+    h_all = h                                     # growth uses the whole history, never the from/to display range
+    growth = _growth_block(h_all)
     h = _in_range(h, start, end)
     if df.empty:                                  # valid category, but nothing to forecast: answer 200 with an empty state
         hist = h.groupby('Month').agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')).reset_index() \
             .rename(columns={'Month': 'month'})
         return {'filter': {'kind': kind, 'value': val} if category else None, 'total': [], 'by_category': [],
-                'by_group': [], 'history': hist.round(2).to_dict('records'), 'history_by_category': [],
+                'by_group': [], 'history': hist.round(2).to_dict('records'), 'history_by_category': [], 'growth': growth,
                 'message': "No forecast is available for this category yet (it has no trained model category, or no product in it sold in the last 6 months)."}
-    total = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()]
-    by_cat = [{'category': r['category'], 'group': ca.group_of(r['category']), 'month': r['month'], **_fmt(r)}
-              for _, r in _rollup(df, ['category']).sort_values(['category', 'month']).iterrows()]
-    by_grp = [{'group': r['shop_group'], 'month': r['month'], **_fmt(r)}
-              for _, r in _rollup(df, ['shop_group']).sort_values(['shop_group', 'month']).iterrows()]
+    last = _actual_months(h_all)[0]
+    total = _total_with_mom(df, h_all)
+    base_c, base_g = _month_base(h_all, last, ['category']), _month_base(h_all, last, ['shop_group'])
+    by_cat = []
+    for c, g in _rollup(df, ['category']).sort_values(['category', 'month']).groupby('category'):
+        by_cat += [{'category': c, 'group': ca.group_of(c), **r}
+                   for r in _with_mom([{'month': r['month'], **_fmt(r)} for _, r in g.iterrows()], base_c.get(c, (0.0, 0.0)))]
+    by_grp = []
+    for gname, g in _rollup(df, ['shop_group']).sort_values(['shop_group', 'month']).groupby('shop_group'):
+        by_grp += [{'group': gname, **r}
+                   for r in _with_mom([{'month': r['month'], **_fmt(r)} for _, r in g.iterrows()], base_g.get(gname, (0.0, 0.0)))]
     hist = h.groupby('Month').agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')).reset_index()
     hist = hist.rename(columns={'Month': 'month'})
     hist_cat = h.groupby(['Month', 'category']).agg(actual_revenue=('revenue', 'sum'), actual_units=('units_sold', 'sum')) \
         .reset_index().rename(columns={'Month': 'month'})
     return {'filter': {'kind': kind, 'value': val} if category else None, 'total': total, 'by_category': by_cat,
             'by_group': by_grp, 'history': hist.round(2).to_dict('records'),
-            'history_by_category': hist_cat.round(2).to_dict('records')}
+            'history_by_category': hist_cat.round(2).to_dict('records'), 'growth': growth}
+
+
+@functools.lru_cache(maxsize=1)
+def _abc():
+    """ABC class of every product that has net revenue in the last 12 closed months (whole shop, not per category)."""
+    return abc.classify(_history())
+
+
+def get_abc(category=None, abc_class=None, top=300):
+    """ABC (Pareto) classification: A = first 80% of net revenue, B = next 15%, C = last 5%, over the last 12 months.
+    Classes are always computed across the WHOLE shop; `category` / `abc_class` only filter what is listed."""
+    table = _abc()
+    summary = [{'class': c, 'products': int((table['abc_class'] == c).sum()),
+                'revenue_share_pct': round(float(table.loc[table['abc_class'] == c, 'revenue_share'].sum()) * 100, 1)}
+               for c in ('A', 'B', 'C')]
+    t = table
+    flt = None
+    if category:
+        kind, val = ca.resolve_filter(category)
+        col = {'label': 'category', 'group': 'group'}.get(kind)
+        if col is None:
+            raise ValueError("ABC supports a shop category or group, not an internal model category.")
+        t = t[t[col] == val]; flt = {'kind': kind, 'value': val}
+    if abc_class:
+        c = str(abc_class).strip().upper()
+        if c not in ('A', 'B', 'C'):
+            raise ValueError("class must be A, B or C")
+        t = t[t['abc_class'] == c]
+    months = sorted(_history()['Month'].unique())[-abc.WINDOW_MONTHS:]
+    rows = [{'msku': m, 'product_name': r.product_name, 'category': r.category, 'group': r.group,
+             'units': int(r.units), 'net_revenue': round(float(r.revenue), 2),
+             'revenue_share_pct': round(float(r.revenue_share) * 100, 2),
+             'cumulative_share_pct': round(float(r.cumulative_share) * 100, 2), 'abc_class': r.abc_class}
+            for m, r in t.head(int(top)).iterrows()]
+    return {'window': {'from': months[0], 'to': months[-1], 'months': len(months)},
+            'cutoffs': {'A': f'first {abc.A_CUT:.0%} of net revenue', 'B': f'up to {abc.B_CUT:.0%}', 'C': 'the rest'},
+            'filter': flt, 'summary': summary, 'total_classified': int(len(table)), 'listed': len(rows), 'products': rows}
 
 
 def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
@@ -616,6 +683,7 @@ def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
         kind, val = ca.resolve_filter(category)
         df = _filter(df, kind, val)
     sh = _product_shares().set_index('MSKU')
+    abc_class = _abc()['abc_class']
     g = df.groupby('msku').agg(product_name=('product_name', 'first'), category=('category', 'first'),
                                group=('shop_group', 'first'), model_category=('model_category', 'first'),
                                u=('u', 'sum'), u_lo=('u_lo', 'sum'), u_hi=('u_hi', 'sum'), r=('r', 'sum')).reset_index()
@@ -625,7 +693,7 @@ def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
         last3 = float(sh.loc[p.msku, 'last3_units']); active = int(sh.loc[p.msku, 'months_active'])
         rows.append({
             'msku': p.msku, 'product_name': p.product_name, 'category': p.category, 'group': p.group,
-            'model_category': p.model_category,
+            'model_category': p.model_category, 'abc_class': abc_class.get(p.msku),
             'last_3m_units': int(last3), 'forecast_units': round(p.u, 1),
             'forecast_units_low': round(max(p.u - p.u_lo, 0), 1), 'forecast_units_high': round(p.u + p.u_hi, 1),
             'forecast_revenue': round(p.r, 2),
@@ -641,7 +709,10 @@ def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
             r['range_revenue'] = round(float(rg['revenue'].get(r['msku'], 0)), 2)
     rows.sort(key=lambda r: r['forecast_units'], reverse=True)
     # overall total for the selection = sum of the product forecasts (bands add in quadrature across categories)
-    total = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()] if not df.empty else []
+    h_sel = _history().rename(columns={'Shop Category': 'category', 'Shop Group': 'shop_group', 'Category': 'model_category'})
+    if category:
+        h_sel = _filter(h_sel, kind, val)
+    total = _total_with_mom(df, h_sel) if not df.empty else []     # each month vs the one before; first vs latest actual month
     out = {'horizon_months': horizon, 'range': {'from': start, 'to': end} if (start or end) else None, 'filter': {'kind': kind, 'value': val} if category else None,
             'total': total, 'products': rows[:int(top)], 'total_products': len(rows)}
     if not rows:
@@ -668,6 +739,7 @@ def get_model_metrics():
             'wape_pct': round(float(err.abs().sum() / a * 100), 1),
             'naive_last_month_wape_pct': round(float((m['actual'] - m[lag]).abs().sum() / a * 100), 1),
             'moving_avg_6m_wape_pct': round(float((m['actual'] - m[roll6]).abs().sum() / a * 100), 1),
+            'method': 'predicted units x mean of the last 3 monthly average prices' if target == 'revenue' else 'XGBoost (Poisson)',
             'mae': round(float(err.abs().mean()), 2), 'rmse': round(float((err ** 2).mean() ** 0.5), 2),
             'nrmse_pct': summ['nrmse_pct'],
             'bias_pct': round(float((m['predicted'].sum() / m['actual'].sum() - 1) * 100), 1),

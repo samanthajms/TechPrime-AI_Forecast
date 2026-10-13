@@ -187,7 +187,14 @@ def fetch_monthly_product_sales() -> pd.DataFrame:
 def filter_known_categories(df: pd.DataFrame, col: str, allow_new: bool) -> pd.DataFrame:
     """The models only know the categories in category_code_map.json. A category they have never seen would get a
     brand-new code and almost no history, so by default it is reported and skipped instead of silently added."""
-    known = set(json.load(open(CATEGORY_MAP_PATH))) if CATEGORY_MAP_PATH.exists() else set()
+    # The SQL upper-cases p.category, but the system labels are mixed case ("Processor INTEL", "CPU Cooling"): restore the
+    # system spelling first, otherwise live rows would never match the code map and every retrain would skip them.
+    df = df.copy()
+    df[col] = df[col].map(lambda c: ca.canonical_label(c) or c)
+    known = set()
+    if CATEGORY_MAP_PATH.exists():
+        with open(CATEGORY_MAP_PATH) as fh:
+            known = set(json.load(fh))
     if allow_new or not known:
         return df
     unknown = sorted(set(df[col].unique()) - known)

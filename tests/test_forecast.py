@@ -241,5 +241,189 @@ class SystemCategories(unittest.TestCase):
                 self.assertIn(k, m[target], f"{target}.{k}")
 
 
+class LiveCategoryNames(unittest.TestCase):
+    def test_upper_cased_db_categories_are_restored_before_the_code_map_check(self):
+        import pandas as pd
+        import rebuild_features_from_db as r
+        live = pd.DataFrame({"category": ["PROCESSOR INTEL", "MEMORY", "NOT A CATEGORY"], "units_sold": [1, 2, 3]})
+        out = r.filter_known_categories(live, "category", allow_new=False)
+        self.assertEqual(sorted(out["category"]), ["Memory", "Processor INTEL"])      # system spelling, unknown one skipped
+
+
+class RevenueFromUnits(unittest.TestCase):
+    def test_revenue_is_units_times_flat_expected_price(self):
+        import inventory_forecasting as f
+        rows = f.get_forecast(category="model:Memory", horizon=3)
+        series = f._monthly_series("Memory")
+        price = f.expected_unit_price(series)
+        self.assertAlmostEqual(price, float(series["avg_price"].tail(3).mean()), places=6)     # mean of the last 3 monthly prices
+        for r in rows:                                                                         # same price every step: nothing compounds
+            self.assertAlmostEqual(r["predicted_revenue"], r["predicted_units"] * price, delta=price * 0.06 + 0.01)
+
+    def test_no_revenue_model_file_or_feedback(self):
+        import inventory_forecasting as f
+        self.assertFalse(hasattr(f, "_revenue_model"))
+        self.assertFalse((ROOT / "xgb_monthly_revenue_model.json").exists())
+
+    def test_small_categories_stay_near_their_real_revenue(self):
+        import inventory_forecasting as f
+        h = f._history()
+        last3 = h[h["Month"].isin(sorted(h["Month"].unique())[-3:])]
+        actual = last3.groupby("Shop Category")["revenue"].sum() / 3                          # typical monthly revenue
+        units = last3.groupby("Shop Category")["units_sold"].sum() / 3
+        r = f.get_revenue_forecast(horizon=3)
+        for row in r["by_category"]:
+            base = actual.get(row["category"], 0)
+            if base > 0 and units.get(row["category"], 0) >= 5:       # skip near-dormant categories: their error is the unit forecast's
+                self.assertLess(row["predicted_revenue"], base * 5, row["category"])           # the old model forecast CCTV at 15x
+
+    def test_metrics_say_how_revenue_is_made(self):
+        import inventory_forecasting as f
+        self.assertIn("units", f.get_model_metrics()["revenue"]["method"])
+
+
+class MonthOverMonth(unittest.TestCase):
+    def test_pct_and_chain(self):
+        import inventory_forecasting as f
+        self.assertEqual(f._pct(110, 100), 10.0)
+        self.assertEqual(f._pct(50, 100), -50.0)
+        self.assertIsNone(f._pct(5, 0))                                  # growth from nothing is undefined, not infinite
+        rows = [{"month": "2026-10", "predicted_units": 120.0, "predicted_revenue": 1000.0},
+                {"month": "2026-11", "predicted_units": 90.0, "predicted_revenue": 1100.0}]
+        out = f._with_mom(rows, (100.0, 800.0))                          # first month vs latest ACTUAL, then vs previous forecast
+        self.assertEqual([r["units_mom_pct"] for r in out], [20.0, -25.0])
+        self.assertEqual([r["revenue_mom_pct"] for r in out], [25.0, 10.0])
+
+    def test_revenue_forecast_growth_matches_history_and_ignores_display_range(self):
+        import inventory_forecasting as f
+        full = f.get_revenue_forecast(horizon=2)
+        ranged = f.get_revenue_forecast(horizon=2, start="2026-01", end="2026-03")
+        self.assertEqual(full["growth"], ranged["growth"])               # from/to only limits the chart history
+        g = full["growth"]
+        self.assertEqual(g["last_actual_month"], f._history()["Month"].max())
+        self.assertAlmostEqual(g["revenue_mom_pct"], (g["last_actual_revenue"] / g["previous_revenue"] - 1) * 100, delta=0.1)
+        first = full["total"][0]
+        self.assertAlmostEqual(first["units_mom_pct"], (first["predicted_units"] / g["last_actual_units"] - 1) * 100, delta=0.1)
+        for row in full["by_category"]:
+            self.assertIn("units_mom_pct", row); self.assertIn("revenue_mom_pct", row)
+
+    def test_demand_screen_total_has_mom(self):
+        import inventory_forecasting as f
+        t = f.get_product_demand(horizon=2, top=1)["total"]
+        self.assertTrue(all("units_mom_pct" in m for m in t))
+
+
+class AbcClassification(unittest.TestCase):
+    def test_pareto_cutoffs(self):
+        import pandas as pd
+        import abc_classification as abc
+        rev = {"a": 700, "b": 200, "c": 60, "d": 40, "zero": 0, "neg": -5}
+        h = pd.DataFrame({"Month": "2026-09", "MSKU": list(rev), "Product Name": list(rev), "Shop Category": "Memory",
+                          "Shop Group": "Component", "units_sold": 1, "revenue": list(rev.values())})
+        t = abc.classify(h)
+        self.assertEqual(t["abc_class"].to_dict(), {"a": "A", "b": "A", "c": "B", "d": "C"})   # shares before: 0 / .70 / .90 / .96
+        self.assertNotIn("zero", t.index); self.assertNotIn("neg", t.index)                  # no positive revenue -> no class
+
+    def test_real_history_split_and_demand_rows_carry_class(self):
+        import inventory_forecasting as f
+        a = f.get_abc(top=5)
+        shares = {s["class"]: s["revenue_share_pct"] for s in a["summary"]}
+        self.assertGreaterEqual(shares["A"], 80.0); self.assertAlmostEqual(sum(shares.values()), 100.0, delta=0.2)
+        self.assertEqual(a["products"][0]["abc_class"], "A")
+        self.assertEqual({r["abc_class"] for r in f.get_abc(abc_class="b", top=500)["products"]}, {"B"})
+        with self.assertRaises(ValueError):
+            f.get_abc(abc_class="Z")
+        rows = f.get_product_demand(horizon=1, top=20)["products"]
+        self.assertTrue(all(r["abc_class"] in ("A", "B", "C", None) for r in rows))
+
+
+class InventoryActions(unittest.TestCase):
+    def test_plan_row_math(self):
+        import inventory_planning as ip
+        # d = 2/day, sigma = 6/month, L = 7, 95%: SS = ceil(1.645 x 6 x sqrt(7/30.4)) = 5, ROP = 14 + 5 = 19, order-up-to = 19 + 60 = 79
+        r = ip.plan_row(10, 0, 2, 6, 7, 0.95)
+        self.assertEqual((r["safety_stock"], r["reorder_point"], r["order_up_to"]), (5, 19, 79))
+        self.assertEqual((r["stockout_risk"], r["action"], r["recommended_order_qty"], r["days_of_inventory"]), ("high", "order_now", 69, 5.0))
+        r = ip.plan_row(18, 0, 2, 6, 7, 0.95)                             # 9 days of cover (>= lead time) but below the ROP
+        self.assertEqual((r["stockout_risk"], r["action"], r["recommended_order_qty"]), ("medium", "reorder", 61))
+        r = ip.plan_row(100, 0, 2, 6, 7, 0.95)
+        self.assertEqual((r["stockout_risk"], r["action"], r["recommended_order_qty"], r["overstock"]), ("low", "ok", 0, False))
+        r = ip.plan_row(500, 0, 2, 6, 7, 0.95)                            # 250 days of cover
+        self.assertEqual((r["action"], r["overstock"], r["recommended_order_qty"], r["excess_units"]), ("overstocked", True, 0, 320))
+        r = ip.plan_row(0, 40, 2, 6, 7, 0.95)                             # nothing on hand but 40 already ordered
+        self.assertEqual((r["stockout_risk"], r["action"], r["recommended_order_qty"]), ("high", "awaiting_delivery", 0))
+        r = ip.plan_row(5, 0, 0, 3, 7, 0.95)                              # stock but no forecast demand
+        self.assertEqual((r["action"], r["overstock"], r["days_of_inventory"], r["recommended_order_qty"]), ("no_demand", True, None, 0))
+        self.assertGreater(ip.plan_row(10, 0, 2, 6, 7, 0.98)["safety_stock"], ip.plan_row(10, 0, 2, 6, 7, 0.90)["safety_stock"])
+
+    def _stock_file(self, text):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+        fh.write(text); fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def test_snapshot_cleaning_and_missing_file(self):
+        import inventory_forecasting as f
+        import inventory_planning as ip
+        top = f.get_abc(top=3)["products"]
+        a, b, c = (p["msku"] for p in top)
+        path = self._stock_file(f"MSKU,stock_on_hand,on_order,lead_time_days,snapshot_at\n{a},10,0,,2026-10-01T00:00:00+00:00\n"
+                                f"{b},-4,0,,\n{c},abc,0,,\n{a},12,3,14,\nNOPE-999,5,0,,\n")
+        stock, as_of, q = ip.load_stock(path)
+        self.assertEqual(q["rows_in_file"], 5); self.assertEqual(q["duplicate_msku_rows"], 1)
+        self.assertEqual(q["rows_skipped_invalid"], 2)                    # negative and non-numeric stock are dropped, never guessed
+        self.assertEqual(stock.loc[a, "stock_on_hand"], 12)               # the later duplicate wins
+        self.assertEqual(stock.loc[a, "lead_time_days"], 14)
+        with self.assertRaises(ip.StockUnavailable):
+            ip.load_stock("/no/such/stock.csv")
+
+    def test_actions_use_snapshot_lead_time_then_request_override_and_flag_staleness(self):
+        import inventory_forecasting as f
+        import inventory_planning as ip
+        a = f.get_product_demand(horizon=1, top=1)["products"][0]["msku"]
+        path = self._stock_file(f"MSKU,stock_on_hand,on_order,lead_time_days,snapshot_at\n{a},40,0,21,2020-01-01T00:00:00+00:00\nNOPE-999,5,0,,\n")
+        old = ip.STOCK_PATH
+        ip.STOCK_PATH = __import__("pathlib").Path(path)
+        try:
+            r = ip.get_inventory_actions(horizon=1)
+            self.assertEqual([p["msku"] for p in r["products"]], [a])     # a stock row for an unknown MSKU is ignored
+            p = r["products"][0]
+            self.assertEqual((p["lead_time_days"], p["lead_time_source"]), (21, "stock snapshot"))
+            self.assertTrue(r["stock_stale"])
+            self.assertIn("PLACEHOLDER", r["assumptions"]["lead_time_note"])
+            self.assertEqual(ip.get_inventory_actions(horizon=1, lead_time_days=3)["products"][0]["lead_time_source"], "request")
+            with self.assertRaises(ValueError):
+                ip.get_inventory_actions(horizon=1, lead_time_days=0)
+            with self.assertRaises(ValueError):
+                ip.get_inventory_actions(horizon=1, action="bogus")
+        finally:
+            ip.STOCK_PATH = old
+
+    def test_sample_snapshot_and_endpoints(self):
+        import forecast_service
+        import inventory_planning as ip
+        importlib.reload(forecast_service)
+        c, h = forecast_service.app.test_client(), {"X-API-Key": "test-key"}
+        old = ip.STOCK_PATH
+        try:
+            ip.STOCK_PATH = ROOT / "no-such-stock.csv"
+            r = c.get("/api/inventory/actions", headers=h)
+            self.assertEqual(r.status_code, 503); self.assertIn("stock snapshot", r.get_json()["error"])
+            ip.STOCK_PATH = ROOT / "current_stock.sample.csv"
+            r = c.get("/api/inventory/actions?action=order_now&top=5", headers=h)
+            self.assertEqual(r.status_code, 200)
+            body = r.get_json()
+            self.assertTrue(all(p["action"] == "order_now" for p in body["products"]))
+            self.assertEqual(sum(body["summary"].values()), body["total_products"])
+            for bad in ("class=Z", "action=zzz", "lead_time_days=abc", "horizon=9"):
+                self.assertEqual(c.get("/api/inventory/actions?" + bad, headers=h).status_code, 400, bad)
+            self.assertEqual(c.get("/api/abc?class=A&top=3", headers=h).status_code, 200)
+            self.assertEqual(c.get("/api/abc?class=Q", headers=h).status_code, 400)
+            self.assertEqual(c.get("/api/inventory/actions").status_code, 401)             # still needs the API key
+        finally:
+            ip.STOCK_PATH = old
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 """
 rebuild_models_v2.py
 =====================
-Monthly retrain script for the demand + revenue XGBoost models.
+Monthly retrain script for the XGBoost demand model, plus the held-out accuracy of the derived revenue forecast.
 
 THIS IS THE SCRIPT `inventory_forecasting.py` REFERS TO under "WHAT TO SWAP
 FOR PRODUCTION" -- run it every time you retrain (recommended: monthly, once
@@ -25,11 +25,14 @@ WHAT THIS SCRIPT DOES:
   - Splits chronologically: first 80% of available months = train,
     most recent 20% = test. The split is by MONTH, not by row, so no
     category's test rows are ever chronologically earlier than its train rows.
-  - Trains both models fresh on the 80% train months. Early stopping uses
+  - Trains the demand model fresh on the 80% train months. Revenue is NOT a second learned model: it is predicted units x
+    the mean of the category's last 3 monthly average prices (the same rule inventory_forecasting.get_forecast uses), so the
+    revenue accuracy files below describe that derivation. (A separate XGBoost revenue model scored 35.0% WAPE against 18.7%
+    for this rule on the same held-out months and was retired.) Early stopping uses
     only the last few TRAIN months, so the 20% test months are never used
     for fitting or tuning and the reported test error is out-of-sample
   - Writes/overwrites:
-      xgb_monthly_demand_model.json, xgb_monthly_revenue_model.json
+      xgb_monthly_demand_model.json
       category_confidence.csv, revenue_category_confidence.csv   (per-category
           MAE/RMSE/avg_actual over the held-out 20% -- feeds
           get_forecast_confidence() and flag_high_variance_categories())
@@ -66,7 +69,6 @@ BASE_DIR = Path(__file__).parent
 
 FEATURES_PATH = BASE_DIR / 'preprocessed_monthly_features.csv'
 DEMAND_MODEL_PATH = BASE_DIR / 'xgb_monthly_demand_model.json'
-REVENUE_MODEL_PATH = BASE_DIR / 'xgb_monthly_revenue_model.json'
 CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
 MONTHLY_PREDICTIONS_PATH = BASE_DIR / 'monthly_predictions.csv'
@@ -75,10 +77,6 @@ ACCURACY_PATH = BASE_DIR / 'model_accuracy.json'      # MAE / RMSE / WAPE / NRMS
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
-REVENUE_FEATURES = ['revenue_lag_1', 'revenue_lag_12', 'revenue_roll_mean_3', 'revenue_roll_mean_6',
-                     'avg_price_lag_1', 'avg_price_roll_mean_3', 'price_trend',
-                     'month_num', 'quarter', 'category_code']
-
 TRAIN_FRACTION = 0.8  # 80/20 -- redrawn fresh every run, not a fixed historical slice
 
 
@@ -169,7 +167,7 @@ def _gate_report(confidence, target_name, threshold):
     return overall_relative_error, failing
 
 
-ARTIFACTS = [DEMAND_MODEL_PATH, REVENUE_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, REVENUE_CONFIDENCE_PATH,
+ARTIFACTS = [DEMAND_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, REVENUE_CONFIDENCE_PATH,
              MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH, ACCURACY_PATH]
 
 
@@ -253,9 +251,10 @@ def main():
     demand_preds = np.clip(demand_model.predict(test_df[DEMAND_FEATURES]), 0, None)
     demand_log, demand_confidence = _per_category_confidence(test_df, demand_preds, 'units_sold')
 
-    # ---------------- Revenue model ----------------
-    revenue_model = _train_one_model(train_df, test_df, REVENUE_FEATURES, 'revenue')
-    revenue_preds = np.clip(revenue_model.predict(test_df[REVENUE_FEATURES]), 0, None)
+    # ---------------- Revenue = predicted units x expected unit price (no second model) ----------------
+    # avg_price_roll_mean_3 = mean of the 3 monthly average prices BEFORE the month (leakage-free); the units are the
+    # demand model's PREDICTIONS, so this scores exactly what the service serves.
+    revenue_preds = demand_preds * test_df['avg_price_roll_mean_3'].values
     revenue_log, revenue_confidence = _per_category_confidence(test_df, revenue_preds, 'revenue')
 
     # ---------------- Promotion gate + backup ----------------
@@ -268,7 +267,6 @@ def main():
 
     # ---------------- Persist artifacts ----------------
     demand_model.save_model(str(DEMAND_MODEL_PATH))
-    revenue_model.save_model(str(REVENUE_MODEL_PATH))
     demand_confidence.to_csv(CATEGORY_CONFIDENCE_PATH)
     revenue_confidence.to_csv(REVENUE_CONFIDENCE_PATH)
 
@@ -280,7 +278,7 @@ def main():
     revenue_log_out['Month'] = revenue_log_out['Month'].astype(str)
     revenue_log_out.to_csv(REVENUE_PREDICTIONS_PATH, index=False)
 
-    print(f"\nSaved: {DEMAND_MODEL_PATH.name}, {REVENUE_MODEL_PATH.name}, "
+    print(f"\nSaved: {DEMAND_MODEL_PATH.name}, "
           f"{CATEGORY_CONFIDENCE_PATH.name}, {REVENUE_CONFIDENCE_PATH.name}, "
           f"{MONTHLY_PREDICTIONS_PATH.name}, {REVENUE_PREDICTIONS_PATH.name}, {ACCURACY_PATH.name}")
 
@@ -288,7 +286,7 @@ def main():
     accuracy = {'generated_at': datetime.now().isoformat(timespec='seconds'),
                 'split': {'train_months': [str(m) for m in train_months], 'test_months': [str(m) for m in test_months]},
                 'demand': {**am.summarize(demand_log), 'baselines': _baselines(test_df, 'units_sold', 'lag_1', 'roll_mean_6')},
-                'revenue': {**am.summarize(revenue_log), 'baselines': _baselines(test_df, 'revenue', 'revenue_lag_1', 'revenue_roll_mean_6')}}
+                'revenue': {**am.summarize(revenue_log), 'method': 'predicted units x mean of the last 3 monthly average prices', 'baselines': _baselines(test_df, 'revenue', 'revenue_lag_1', 'revenue_roll_mean_6')}}
     ACCURACY_PATH.write_text(json.dumps(accuracy, indent=2))
     _accuracy_report('demand', accuracy['demand'], 'units')
     _accuracy_report('revenue', accuracy['revenue'], 'PHP')

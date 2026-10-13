@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-13T11:26:39",
+  "generated_at": "2026-10-13T14:00:07",
   "split": {
     "train_months": [
       "2025-09",
@@ -49,17 +49,18 @@
       "2026-08",
       "2026-09"
     ],
-    "mae": 465327.49,
-    "rmse": 953572.86,
-    "wape_pct": 35.0,
-    "nrmse_pct": 71.8,
-    "bias_pct": -12.8,
+    "mae": 248550.81,
+    "rmse": 496558.01,
+    "wape_pct": 18.7,
+    "nrmse_pct": 37.4,
+    "bias_pct": -13.2,
     "total_level_ape_pct_by_month": {
-      "2026-07": 23.3,
-      "2026-08": 4.7,
-      "2026-09": 10.2
+      "2026-07": 13.7,
+      "2026-08": 13.1,
+      "2026-09": 13.0
     },
-    "total_level_mape_pct": 12.7,
+    "total_level_mape_pct": 13.2,
+    "method": "predicted units x mean of the last 3 monthly average prices",
     "baselines": {
       "naive_last_month_wape_pct": 21.7,
       "moving_avg_6m_wape_pct": 13.5
