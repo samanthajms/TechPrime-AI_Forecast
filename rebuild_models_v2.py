@@ -60,6 +60,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+import accuracy_metrics as am
+
 BASE_DIR = Path(__file__).parent
 
 FEATURES_PATH = BASE_DIR / 'preprocessed_monthly_features.csv'
@@ -69,6 +71,7 @@ CATEGORY_CONFIDENCE_PATH = BASE_DIR / 'category_confidence.csv'
 REVENUE_CONFIDENCE_PATH = BASE_DIR / 'revenue_category_confidence.csv'
 MONTHLY_PREDICTIONS_PATH = BASE_DIR / 'monthly_predictions.csv'
 REVENUE_PREDICTIONS_PATH = BASE_DIR / 'revenue_predictions.csv'
+ACCURACY_PATH = BASE_DIR / 'model_accuracy.json'      # MAE / RMSE / WAPE / NRMSE / bias / total-level error of the held-out months
 
 DEMAND_FEATURES = ['lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6',
                     'roll_std_3', 'month_num', 'quarter', 'category_code']
@@ -105,12 +108,12 @@ def _chronological_split(df, train_fraction=TRAIN_FRACTION):
 VAL_MONTHS = 3  # most recent TRAIN months held out for early stopping (never the 20% test months)
 
 
-def _train_one_model(train_df, test_df, features, target_col):
+def _train_one_model(train_df, test_df, features, target_col, objective='reg:squarederror'):
     """Fit on the 80% train months only. Early stopping picks the number of trees using the last VAL_MONTHS train
     months, then the model is refit on the full 80% with that tree count. The 20% test months are never seen
     during fitting or tuning, so the reported test error is an honest out-of-sample number."""
     params = dict(max_depth=3, learning_rate=0.1, subsample=0.9, colsample_bytree=0.9,
-                  objective='reg:squarederror', random_state=42)
+                  objective=objective, random_state=42)
 
     months = sorted(train_df['Month'].unique())
     n_val = min(VAL_MONTHS, max(1, len(months) // 5))
@@ -139,6 +142,7 @@ def _per_category_confidence(test_df, predictions, target_col):
             'mae': float(err.abs().mean()),
             'rmse': float(np.sqrt((err ** 2).mean())),
             'avg_actual': float(g['actual'].mean()),
+            'wape': am.wape(g['actual'], g['predicted']),      # scale-free, comparable across categories
         })
     confidence = pd.DataFrame(rows).set_index('Category')
     return out, confidence
@@ -150,7 +154,7 @@ def _gate_report(confidence, target_name, threshold):
     overall_relative_error = float(df['rmse'].mean() / df['avg_actual'].replace(0, np.nan).mean())
 
     print(f"\n--- PRE-DEPLOYMENT GATE: {target_name} ---")
-    print(f"Overall avg relative error (RMSE / avg_actual): "
+    print(f"Overall avg relative error (equal-weighted NRMSE, RMSE / avg_actual): "
           f"{overall_relative_error:.1%}" if np.isfinite(overall_relative_error) else "N/A")
 
     failing = df[df['relative_error'] > threshold].sort_values('relative_error', ascending=False)
@@ -166,7 +170,27 @@ def _gate_report(confidence, target_name, threshold):
 
 
 ARTIFACTS = [DEMAND_MODEL_PATH, REVENUE_MODEL_PATH, CATEGORY_CONFIDENCE_PATH, REVENUE_CONFIDENCE_PATH,
-             MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH]
+             MONTHLY_PREDICTIONS_PATH, REVENUE_PREDICTIONS_PATH, ACCURACY_PATH]
+
+
+def _baselines(test_df, target_col, lag_col, roll6_col):
+    """WAPE of two no-model forecasts on the same held-out rows. The XGBoost model has to beat these to be worth using."""
+    a = test_df[target_col]
+    return {'naive_last_month_wape_pct': round(am.wape(a, test_df[lag_col]) * 100, 1),
+            'moving_avg_6m_wape_pct': round(am.wape(a, test_df[roll6_col]) * 100, 1)}
+
+
+def _accuracy_report(name, summary, unit):
+    """Print the study metrics for one model. WAPE and the total-level error are the headline numbers; the
+    equal-weighted 'relative error' printed by _gate_report() lets tiny categories dominate the average."""
+    print(f"\n--- ACCURACY ({name}, held-out months {', '.join(summary['test_months'])}) ---")
+    print(f"MAE   {summary['mae']:,.2f} {unit}   RMSE  {summary['rmse']:,.2f} {unit}   (scale-dependent, pooled over all categories)")
+    print(f"WAPE  {summary['wape_pct']:.1f}%   NRMSE {summary['nrmse_pct']:.1f}%   Bias {summary['bias_pct']:+.1f}%   (scale-free)")
+    by_month = ', '.join(f"{m}: {v:.1f}%" for m, v in summary['total_level_ape_pct_by_month'].items())
+    print(f"Total-level error (all categories summed): mean {summary['total_level_mape_pct']:.1f}%  [{by_month}]")
+    b = summary['baselines']
+    print(f"Benchmarks (WAPE, no model): last month {b['naive_last_month_wape_pct']:.1f}%   6-month average {b['moving_avg_6m_wape_pct']:.1f}%"
+          f"   -> the model should be at or below these")
 
 
 def _overall_rel_error(conf_df):
@@ -223,7 +247,9 @@ def main():
           f"test = {test_months[0]}..{test_months[-1]} ({len(test_months)} months)")
 
     # ---------------- Demand model ----------------
-    demand_model = _train_one_model(train_df, test_df, DEMAND_FEATURES, 'units_sold')
+    # Units are non-negative counts: the Poisson objective beat squared error in both backtests run on this project
+    # (26-month POS history and the 13-month sample). Revenue is continuous, so it keeps squared error.
+    demand_model = _train_one_model(train_df, test_df, DEMAND_FEATURES, 'units_sold', objective='count:poisson')
     demand_preds = np.clip(demand_model.predict(test_df[DEMAND_FEATURES]), 0, None)
     demand_log, demand_confidence = _per_category_confidence(test_df, demand_preds, 'units_sold')
 
@@ -256,7 +282,16 @@ def main():
 
     print(f"\nSaved: {DEMAND_MODEL_PATH.name}, {REVENUE_MODEL_PATH.name}, "
           f"{CATEGORY_CONFIDENCE_PATH.name}, {REVENUE_CONFIDENCE_PATH.name}, "
-          f"{MONTHLY_PREDICTIONS_PATH.name}, {REVENUE_PREDICTIONS_PATH.name}")
+          f"{MONTHLY_PREDICTIONS_PATH.name}, {REVENUE_PREDICTIONS_PATH.name}, {ACCURACY_PATH.name}")
+
+    # ---------------- Accuracy metrics (MAE, RMSE, WAPE, NRMSE, bias, total-level error) ----------------
+    accuracy = {'generated_at': datetime.now().isoformat(timespec='seconds'),
+                'split': {'train_months': [str(m) for m in train_months], 'test_months': [str(m) for m in test_months]},
+                'demand': {**am.summarize(demand_log), 'baselines': _baselines(test_df, 'units_sold', 'lag_1', 'roll_mean_6')},
+                'revenue': {**am.summarize(revenue_log), 'baselines': _baselines(test_df, 'revenue', 'revenue_lag_1', 'revenue_roll_mean_6')}}
+    ACCURACY_PATH.write_text(json.dumps(accuracy, indent=2))
+    _accuracy_report('demand', accuracy['demand'], 'units')
+    _accuracy_report('revenue', accuracy['revenue'], 'PHP')
 
     # ---------------- Pre-deployment gate report ----------------
     _gate_report(demand_confidence, 'demand', args.gate_threshold)

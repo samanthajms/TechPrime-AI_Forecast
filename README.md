@@ -13,6 +13,12 @@ Deployed on Render as a web service (see `render.yaml`). Security setup: [`docs/
 - `rebuild_models_v2.py` splits **chronologically by month, 80% train / 20% test**, redrawn each run. Early stopping uses only the last train months, so the test months are never used for fitting or tuning.
 - Test results feed `category_confidence.csv`, `revenue_category_confidence.csv`, `monthly_predictions.csv`, `revenue_predictions.csv` and `GET /api/metrics`.
 
+## Categories
+`Category` in both history files, `category_code_map.json` and every forecast is one of the **system's own category labels** (`category_alignment.taxonomy()`: Chassis Fan, CPU Cooling, Memory, Processor INTEL, ... grouped by `Category Group`: Component, Peripherals, ...). There is no aggregate "All" category and no legacy POS bucket (Combo -> Keyboard and Mouse, Display -> Monitor, ...). The overall total is the sum of the category forecasts (`total` in `/api/forecast/demand` and `/api/forecast/revenue`).
+
+## Accuracy metrics (`model_accuracy.json`, `GET /api/metrics`)
+Computed on the held-out 20% months by `accuracy_metrics.py`: **MAE** and **RMSE** (same unit as the target, scale-dependent), **WAPE** = sum|error| / sum(actual) (scale-free, volume-weighted, safe with zero sales; MAPE is not used for that reason), **NRMSE** = RMSE / mean(actual), **bias**, and the **total-level error** (error of the category forecasts added up). Two no-model benchmarks (last month, 6-month average) are reported next to them; the model should be at or below those.
+
 ## Date-range filter (optional `from` / `to`)
 `/api/forecast/demand` and `/api/forecast/revenue` accept `from=` and `to=` (`YYYY-MM` or `YYYY-MM-DD`). They only choose which **actual** sales months are returned (revenue `history`; demand `range_units` / `range_revenue`). The forecast itself always starts after the latest month in the data and is 1-3 months long.
 

@@ -114,6 +114,13 @@ def taxonomy():
     return {'groups': {g: list(subs) for g, (_, subs) in _TAXONOMY.items()}}
 
 
+def canonical_label(value):
+    """The system label spelled exactly as in the taxonomy for a case-insensitive match ('processor intel' ->
+    'Processor INTEL'), or None when `value` is not one of the system's category labels."""
+    hit = _label_index()[0].get(str(value).strip().lower())
+    return hit[2] if hit else None
+
+
 def group_of(label):
     hit = _label_index()[0].get(str(label).strip().lower())
     return hit[1] if hit else 'Others'

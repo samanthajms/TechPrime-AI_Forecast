@@ -44,6 +44,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import functools
+import accuracy_metrics as am
 import category_alignment as ca
 from dotenv import load_dotenv
 from pathlib import Path
@@ -130,7 +131,16 @@ def _history():
         h = h[h['Month'] <= cutoff]
         if h.empty:
             raise ValueError(f"HISTORY_CUTOFF {cutoff} is before the first month in the history file.")
-    h['Category'] = h['Category'].str.strip().str.upper()          # MODEL category (what the models are trained on)
+    h['Category'] = h['Category'].str.strip()
+    canon = {c: ca.canonical_label(c) for c in h['Category'].unique()}
+    if all(canon.values()):
+        # The history is already in the SYSTEM vocabulary (Chassis Fan, Memory, Processor INTEL, ...): the models are
+        # trained per system label, so the model category IS the shop category and no reclassification is needed.
+        h['Category'] = h['Category'].map(canon)
+        h['Shop Category'] = h['Category']
+        h['Shop Group'] = h['Category'].map(ca.group_of)
+        return h
+    h['Category'] = h['Category'].str.upper()                      # legacy MODEL bucket (MEMORY, DISPLAY, LAPTOP PR2, ...)
     if 'Shop Category' not in h.columns:                           # older file without shop columns -> derive
         cls = {m: ca.classify_product(m, n, c) for m, n, c in
                h.drop_duplicates('MSKU')[['MSKU', 'Product Name', 'Category']].itertuples(index=False)}
@@ -190,10 +200,11 @@ def _resolve_category(category=None, product=None):
         if match.empty:
             raise ValueError(f"Unknown or inactive product '{product}'.")
         row = match.iloc[0]
-        if category is not None and str(category).upper() != row['Category']:
+        if category is not None and str(category).strip().upper() != row['Category'].upper():
             raise ValueError(f"Product '{product}' belongs to '{row['Category']}', not '{category}'.")
         return row['Category'], row
-    return str(category).upper(), None
+    key = str(category).strip().upper()                            # case-insensitive match to the trained category names
+    return {k.upper(): k for k in CATEGORY_CODE_MAP}.get(key, key), None
 
 
 def _monthly_series(category, target_col='units_sold'):
@@ -629,8 +640,10 @@ def get_product_demand(horizon=3, category=None, top=50, start=None, end=None):
             r['range_units'] = int(rg['units_sold'].get(r['msku'], 0))
             r['range_revenue'] = round(float(rg['revenue'].get(r['msku'], 0)), 2)
     rows.sort(key=lambda r: r['forecast_units'], reverse=True)
+    # overall total for the selection = sum of the product forecasts (bands add in quadrature across categories)
+    total = [{'month': r['month'], **_fmt(r)} for _, r in _rollup(df, []).sort_values('month').iterrows()] if not df.empty else []
     out = {'horizon_months': horizon, 'range': {'from': start, 'to': end} if (start or end) else None, 'filter': {'kind': kind, 'value': val} if category else None,
-            'products': rows[:int(top)], 'total_products': len(rows)}
+            'total': total, 'products': rows[:int(top)], 'total_products': len(rows)}
     if not rows:
         out['message'] = "No forecast is available for this category yet (it has no trained model category, or no product in it sold in the last 6 months)."
     return out
@@ -642,19 +655,25 @@ def get_model_metrics():
     feats = pd.read_csv(BASE_DIR / 'preprocessed_monthly_features.csv')
     skip = {'All', 'CUSTOMIZATION'}
     out = {}
-    for target, fname, lag in [('demand', 'monthly_predictions.csv', 'lag_1'),
-                               ('revenue', 'revenue_predictions.csv', 'revenue_lag_1')]:
+    for target, fname, lag, roll6 in [('demand', 'monthly_predictions.csv', 'lag_1', 'roll_mean_6'),
+                                      ('revenue', 'revenue_predictions.csv', 'revenue_lag_1', 'revenue_roll_mean_6')]:
         p = pd.read_csv(BASE_DIR / fname)
-        m = p.merge(feats[['Month', 'Category', lag]], on=['Month', 'Category'])
+        m = p.merge(feats[['Month', 'Category', lag, roll6]], on=['Month', 'Category'])
         m = m[~m['Category'].isin(skip)]
         a = m['actual'].abs().sum()
         err = m['actual'] - m['predicted']
+        summ = am.summarize(m)
         out[target] = {
             'test_months': sorted(m['Month'].unique().tolist()),
             'wape_pct': round(float(err.abs().sum() / a * 100), 1),
             'naive_last_month_wape_pct': round(float((m['actual'] - m[lag]).abs().sum() / a * 100), 1),
+            'moving_avg_6m_wape_pct': round(float((m['actual'] - m[roll6]).abs().sum() / a * 100), 1),
             'mae': round(float(err.abs().mean()), 2), 'rmse': round(float((err ** 2).mean() ** 0.5), 2),
+            'nrmse_pct': summ['nrmse_pct'],
             'bias_pct': round(float((m['predicted'].sum() / m['actual'].sum() - 1) * 100), 1),
+            # accuracy of the overall total when the category forecasts are added up (what the "Total" line shows)
+            'total_level_mape_pct': summ['total_level_mape_pct'],
+            'total_level_ape_pct_by_month': summ['total_level_ape_pct_by_month'],
         }
     h = _history()
     out['data'] = {'first_month': h['Month'].min(), 'last_month': h['Month'].max(), 'history_cutoff': history_cutoff(),
