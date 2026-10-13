@@ -13,6 +13,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv(Path(__file__).parent / ".env")
 import inventory_forecasting as forecast  # noqa: E402  (after load_dotenv so HISTORY_PATH etc. are read)
+import inventory_planning as planning  # noqa: E402
 
 API_KEY = os.environ.get("FORECAST_API_KEY", "")
 if not API_KEY:
@@ -166,9 +167,21 @@ def _category():
     return c or None
 
 
+def _choice(name, allowed):
+    """Optional ?name= limited to `allowed` (case-insensitive)."""
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return None
+    if raw.lower() not in {a.lower() for a in allowed}:
+        raise BadRequest(f"{name} must be one of: {', '.join(allowed)}")
+    return next(a for a in allowed if a.lower() == raw.lower())
+
+
 def _safe(fn):
     try:
         return jsonify(fn())
+    except planning.StockUnavailable as e:       # no stock snapshot: a server-side setup gap, not a bad request
+        return {"error": str(e)}, 503
     except ValueError as e:                      # bad parameter / category / product, not enough history
         return {"error": str(e)}, 400
     except Exception:                            # noqa: BLE001
@@ -198,6 +211,19 @@ def legacy():
     return _safe(lambda: forecast.get_forecast(
         category=_category() or (None if request.args.get("product") else "MEMORY"),
         product=request.args.get("product"), horizon=_horizon()))
+
+
+@app.route("/api/abc")                        # ABC (Pareto) classification of products
+def abc_classes():
+    return _safe(lambda: forecast.get_abc(category=_category(), abc_class=_choice("class", ("A", "B", "C")), top=_top(300)))
+
+
+@app.route("/api/inventory/actions")          # reorder point, safety stock, days of inventory, alerts, order quantity
+def inventory_actions():
+    return _safe(lambda: planning.get_inventory_actions(
+        horizon=_horizon(), category=_category(), abc_class=_choice("class", ("A", "B", "C")),
+        action=_choice("action", planning.ACTIONS), top=_top(100),
+        lead_time_days=_int_arg("lead_time_days", None)))
 
 
 @app.route("/api/metrics")

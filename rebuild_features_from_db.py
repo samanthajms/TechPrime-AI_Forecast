@@ -71,6 +71,8 @@ import psycopg2
 from dotenv import load_dotenv
 import os
 
+import category_alignment as ca
+
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / '.env')
 
@@ -103,7 +105,7 @@ OUTPUT_COLUMNS = [
     'lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6', 'roll_std_3',
     'avg_price_lag_1', 'avg_price_roll_mean_3', 'price_trend',
     'revenue_lag_1', 'revenue_lag_12', 'revenue_roll_mean_3', 'revenue_roll_mean_6',
-    'month_num', 'quarter', 'category_code',
+    'month_num', 'quarter', 'category_code', 'Category Group',
 ]
 
 
@@ -185,7 +187,14 @@ def fetch_monthly_product_sales() -> pd.DataFrame:
 def filter_known_categories(df: pd.DataFrame, col: str, allow_new: bool) -> pd.DataFrame:
     """The models only know the categories in category_code_map.json. A category they have never seen would get a
     brand-new code and almost no history, so by default it is reported and skipped instead of silently added."""
-    known = set(json.load(open(CATEGORY_MAP_PATH))) if CATEGORY_MAP_PATH.exists() else set()
+    # The SQL upper-cases p.category, but the system labels are mixed case ("Processor INTEL", "CPU Cooling"): restore the
+    # system spelling first, otherwise live rows would never match the code map and every retrain would skip them.
+    df = df.copy()
+    df[col] = df[col].map(lambda c: ca.canonical_label(c) or c)
+    known = set()
+    if CATEGORY_MAP_PATH.exists():
+        with open(CATEGORY_MAP_PATH) as fh:
+            known = set(json.load(fh))
     if allow_new or not known:
         return df
     unknown = sorted(set(df[col].unique()) - known)
@@ -207,7 +216,9 @@ def merge_product_history(existing: pd.DataFrame, live: pd.DataFrame) -> pd.Data
         'returns_units': 0.0, 'returns_amount': 0.0, 'net_revenue': live['revenue'].round(2),
         'avg_price': (live['revenue'] / live['units_sold'].where(live['units_sold'] > 0)).round(2),
     })
-    return pd.concat([existing, rows], ignore_index=True).sort_values(['Month', 'Category', 'MSKU'])
+    out = pd.concat([existing, rows], ignore_index=True)
+    out['Category Group'] = out['Category'].map(ca.group_of)          # system category group (Component, Peripherals, ...)
+    return out.sort_values(['Month', 'Category', 'MSKU'])
 
 
 # -----------------------------------------------------------------
@@ -252,13 +263,9 @@ def build_full_grid(monthly: pd.DataFrame) -> pd.DataFrame:
     # a month with zero sales still needs a plausible price for the lag features -- carry the nearest known price
     merged['avg_price'] = merged.groupby('category')['avg_price'].transform(lambda s: s.ffill().bfill())
 
-    # add an "All" row per month too, matching the existing CSV's aggregate total category
-    totals = merged.groupby('month', as_index=False).agg(units_sold=('units_sold', 'sum'), revenue=('revenue', 'sum'))
-    totals['category'] = 'All'
-    totals['avg_price'] = np.where(totals['units_sold'] > 0, totals['revenue'] / totals['units_sold'], np.nan)
-    totals['avg_price'] = totals['avg_price'].ffill().bfill()
-
-    return pd.concat([merged, totals[merged.columns]], ignore_index=True).sort_values(['category', 'month'])
+    # No aggregate "All" row: categories are the system's own labels (category_alignment.taxonomy()). The overall total
+    # is reported as a sum of the category forecasts (see get_product_demand / get_revenue_forecast), not as a category.
+    return merged.sort_values(['category', 'month'])
 
 
 # -----------------------------------------------------------------
@@ -279,23 +286,27 @@ def add_features(full: pd.DataFrame) -> pd.DataFrame:
             def lag(arr, k):
                 return arr[i - k] if i - k >= 0 else 0
 
-            lag_1, lag_2, lag_3, lag_12 = lag(units, 1), lag(units, 2), lag(units, 3), lag(units, 12)
-            window3 = units[max(0, i - 2):i + 1]
-            window6 = units[max(0, i - 5):i + 1]
-            roll_mean_3 = float(np.mean(window3))
-            roll_mean_6 = float(np.mean(window6))
+            # Every window ends at i-1: the month being predicted (i) must never feed its own features, otherwise the
+            # held-out error is understated and the model sees different inputs in training than at inference time
+            # (_build_demand_features() only has the months BEFORE the one it forecasts).
+            lag_1, lag_2, lag_3 = lag(units, 1), lag(units, 2), lag(units, 3)
+            lag_12 = lag(units, 12) if i - 12 >= 0 else lag_3      # same fallback as _build_demand_features()
+            window3 = units[max(0, i - 3):i]
+            window6 = units[max(0, i - 6):i]
+            roll_mean_3 = float(np.mean(window3)) if len(window3) else 0.0
+            roll_mean_6 = float(np.mean(window6)) if len(window6) else 0.0
             roll_std_3 = float(np.std(window3, ddof=1)) if len(window3) > 1 else 0.0
 
             r_lag_1 = lag(revenue, 1)
             r_lag_12 = lag(revenue, 12) if i - 12 >= 0 else r_lag_1
-            r_window3 = revenue[max(0, i - 2):i + 1]
-            r_window6 = revenue[max(0, i - 5):i + 1]
-            revenue_roll_mean_3 = float(np.mean(r_window3))
-            revenue_roll_mean_6 = float(np.mean(r_window6))
+            r_window3 = revenue[max(0, i - 3):i]
+            r_window6 = revenue[max(0, i - 6):i]
+            revenue_roll_mean_3 = float(np.mean(r_window3)) if len(r_window3) else 0.0
+            revenue_roll_mean_6 = float(np.mean(r_window6)) if len(r_window6) else 0.0
 
             p_lag_1 = lag(price, 1) if i - 1 >= 0 else price[i]
-            p_window3 = price[max(0, i - 2):i + 1]
-            avg_price_roll_mean_3 = float(np.mean(p_window3))
+            p_window3 = price[max(0, i - 3):i]
+            avg_price_roll_mean_3 = float(np.mean(p_window3)) if len(p_window3) else float(price[i])
             p_lag_4 = lag(price, 4) if i - 4 >= 0 else None
             price_trend = ((p_lag_1 - p_lag_4) / p_lag_4) if p_lag_4 else 0.0
 
@@ -383,6 +394,7 @@ def main():
         else:
             CATEGORY_MAP_PATH.write_bytes(original_map)
 
+    featured['Category Group'] = featured['Category'].map(ca.group_of)
     featured = featured[OUTPUT_COLUMNS].sort_values(['Category', 'Month']).reset_index(drop=True)
 
     print("Topping up the per-product history the running service reads...")
