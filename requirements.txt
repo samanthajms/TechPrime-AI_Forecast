@@ -7,3 +7,4 @@ python-dotenv==1.*
 xgboost==3.4.1
 pandas>=2.2,<3
 numpy>=1.26,<3
+psycopg2-binary==2.9.*      # live stock (STOCK_SOURCE=db)

@@ -28,14 +28,21 @@ optionally overridden per product by a `lead_time_days` column in the stock snap
 ?lead_time_days=. Every response says where the lead time came from. Order quantities are not rounded to supplier pack
 sizes / minimum order quantities, because there is no supplier data to know them.
 
-STOCK ON HAND is not in the forecast data. It is read from a snapshot CSV (STOCK_PATH, default current_stock.csv):
-    MSKU, stock_on_hand            required
-    on_order, lead_time_days       optional
-    snapshot_at                    optional ISO timestamp (the file's modified time is used when absent)
-Produce it with export_stock_snapshot.py, or write it from the PHP app. The file is re-read whenever it changes.
+STOCK ON HAND is not in the forecast data. STOCK_SOURCE picks where it comes from:
+    file (default)  a snapshot CSV (STOCK_PATH, default current_stock.csv), re-read whenever it changes:
+                        MSKU, stock_on_hand            required
+                        on_order, lead_time_days       optional
+                        snapshot_at                    optional ISO timestamp (the file's modified time is used when absent)
+                    Produce it with export_stock_snapshot.py, or write it from the PHP app.
+    db              live from the database (same DB_* settings as the retrain job, read-only user), using STOCK_SQL
+                    (default: products.sku as MSKU, products.stock as stock_on_hand). The result is cached for
+                    STOCK_CACHE_SECONDS (default 600). If a refresh fails, the last good read is served and its age shows.
 """
+import logging
 import math
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -57,7 +64,13 @@ def _env_num(name, default, cast=float):
         raise RuntimeError(f"{name} must be a number") from None
 
 
+STOCK_SOURCE = os.environ.get('STOCK_SOURCE', 'file').strip().lower()   # 'file' (snapshot CSV) or 'db' (live)
+if STOCK_SOURCE not in ('file', 'db'):
+    raise RuntimeError("STOCK_SOURCE must be 'file' or 'db'")
 STOCK_PATH = Path(os.environ.get('STOCK_PATH', BASE_DIR / 'current_stock.csv'))
+STOCK_SQL = os.environ.get('STOCK_SQL', 'SELECT p.sku AS "MSKU", p.stock AS stock_on_hand FROM products p')
+STOCK_CACHE_SECONDS = _env_num('STOCK_CACHE_SECONDS', 600, int)   # live stock is re-read at most this often
+STOCK_RETRY_SECONDS = 60                                           # after a failed live read, wait this long to retry
 LEAD_TIME_DAYS = _env_num('LEAD_TIME_DAYS', 7, int)              # PLACEHOLDER: there is no supplier role in the system
 REVIEW_DAYS = _env_num('REVIEW_DAYS', 30, int)                   # how many days of demand one order should cover
 OVERSTOCK_DAYS = _env_num('OVERSTOCK_DAYS', 90, int)             # more than this many days of cover = overstock
@@ -81,13 +94,13 @@ class StockUnavailable(RuntimeError):
 # -----------------------------------------------------------------
 # Stock snapshot
 # -----------------------------------------------------------------
-@lru_cache(maxsize=2)
-def _read_stock(path, mtime):
-    raw = pd.read_csv(path, dtype={'MSKU': str})
-    raw.columns = [c.strip() for c in raw.columns]
+def _clean_stock(raw, fallback_as_of):
+    """Validate a raw stock table (from the CSV or the database) into (frame indexed by MSKU, as-of time, counts)."""
+    raw = raw.copy()
+    raw.columns = [str(c).strip() for c in raw.columns]
     if not {'MSKU', 'stock_on_hand'} <= set(raw.columns):
-        raise StockUnavailable(f"{Path(path).name} must have the columns MSKU and stock_on_hand.")
-    raw['MSKU'] = raw['MSKU'].astype(str).str.strip()
+        raise StockUnavailable("The stock data must have the columns MSKU and stock_on_hand.")
+    raw['MSKU'] = raw['MSKU'].where(raw['MSKU'].notna(), '').astype(str).str.strip()
     raw['stock_on_hand'] = pd.to_numeric(raw['stock_on_hand'], errors='coerce')
     for opt in ('on_order', 'lead_time_days'):
         raw[opt] = pd.to_numeric(raw[opt], errors='coerce') if opt in raw.columns else np.nan
@@ -102,14 +115,75 @@ def _read_stock(path, mtime):
     else:
         as_of = pd.NaT
     if pd.isna(as_of):
-        as_of = pd.Timestamp(mtime, unit='s', tz='UTC')
+        as_of = fallback_as_of
     return ok.set_index('MSKU')[['stock_on_hand', 'on_order', 'lead_time_days']], as_of, {
         'rows_in_file': int(total), 'rows_used': int(len(ok)), 'rows_skipped_invalid': int(total - len(ok) - dupes),
         'duplicate_msku_rows': dupes}
 
 
+@lru_cache(maxsize=2)
+def _read_stock(path, mtime):
+    raw = pd.read_csv(path, dtype={'MSKU': str})
+    try:
+        return _clean_stock(raw, pd.Timestamp(mtime, unit='s', tz='UTC'))
+    except StockUnavailable:
+        raise StockUnavailable(f"{Path(path).name} must have the columns MSKU and stock_on_hand.") from None
+
+
+# -----------------------------------------------------------------
+# Live stock from the database (STOCK_SOURCE=db)
+# -----------------------------------------------------------------
+_log = logging.getLogger(__name__)
+_live_lock = threading.Lock()                      # one database read at a time; other requests wait for its result
+_live_cache = {'data': None, 'next_read': 0.0}
+
+
+def _query_stock_table():
+    """Run STOCK_SQL on the database (read-only session) and return the rows as a DataFrame."""
+    import psycopg2                                # only needed when STOCK_SOURCE=db
+    cfg = {'host': os.environ.get('DB_HOST'), 'port': os.environ.get('DB_PORT'), 'dbname': os.environ.get('DB_NAME'),
+           'user': os.environ.get('DB_USER'), 'password': os.environ.get('DB_PASS'), 'sslmode': 'require',
+           'connect_timeout': 10}
+    if not (cfg['host'] and cfg['user'] and cfg['password']):
+        raise StockUnavailable("STOCK_SOURCE=db needs DB_HOST, DB_PORT, DB_NAME, DB_USER and DB_PASS on the forecast service.")
+    conn = psycopg2.connect(**cfg)
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute(STOCK_SQL)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _load_live_stock():
+    """Stock read live from the database, cached for STOCK_CACHE_SECONDS; on a failed refresh the last good read is kept."""
+    with _live_lock:
+        cached = _live_cache['data']
+        if cached is not None and time.monotonic() < _live_cache['next_read']:
+            return cached
+        try:
+            data = _clean_stock(_query_stock_table(), pd.Timestamp.now(tz='UTC'))
+        except StockUnavailable:
+            raise
+        except Exception:                          # noqa: BLE001 - connection / SQL errors: details go to the log only
+            _log.exception("live stock read failed")
+            if cached is None:
+                raise StockUnavailable("Stock could not be read from the database. Check the DB_* settings and "
+                                       "STOCK_SQL on the forecast service.") from None
+            _live_cache['next_read'] = time.monotonic() + STOCK_RETRY_SECONDS
+            return cached                          # stock_as_of keeps the old time, so the response shows its age
+        _live_cache.update(data=data, next_read=time.monotonic() + STOCK_CACHE_SECONDS)
+        return data
+
+
 def load_stock(path=None):
-    """(stock frame indexed by MSKU, snapshot timestamp, row-quality counts). Raises StockUnavailable when absent."""
+    """(stock frame indexed by MSKU, snapshot timestamp, row-quality counts). Raises StockUnavailable when absent.
+    With STOCK_SOURCE=db and no explicit path, the stock is read live from the database instead of the CSV."""
+    if path is None and STOCK_SOURCE == 'db':
+        return _load_live_stock()
     path = Path(path or STOCK_PATH)
     if not path.exists():
         raise StockUnavailable(
@@ -250,6 +324,7 @@ def get_inventory_actions(horizon=3, category=None, abc_class=None, action=None,
     no_stock = len(set(demand.index) - set(stock.index))
     return {
         'horizon_months': horizon, 'forecast_months': months, 'filter': flt,
+        'stock_source': 'database (live)' if STOCK_SOURCE == 'db' else 'snapshot file',
         'stock_as_of': as_of.isoformat(), 'stock_age_days': round(age, 1), 'stock_stale': bool(age > STOCK_MAX_AGE_DAYS),
         'summary': summary, 'total_products': len(rows),
         'assumptions': {

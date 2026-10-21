@@ -23,6 +23,12 @@ services:
         value: "1"
       # - key: HISTORY_CUTOFF   # demo only: e.g. 2026-05 forecasts Jun-Aug as if May were the latest month
       #   value: "2026-05"
-      # - key: STOCK_PATH       # stock-on-hand snapshot read by /api/inventory/actions (default current_stock.csv)
+      # Live stock for /api/inventory/actions: set STOCK_SOURCE=db plus the read-only forecast_ro DB_* credentials
+      # (same values as the GitHub Actions secrets, docs/RENDER_SECURITY_GUIDE.md section 6) in the Render dashboard.
+      # - key: STOCK_SOURCE     # 'db' = read products.stock live (cached STOCK_CACHE_SECONDS, default 600); 'file' = CSV
+      #   value: "db"
+      # - key: DB_HOST          # also DB_PORT, DB_NAME, DB_USER, DB_PASS (sync: false - secrets)
+      #   sync: false
+      # - key: STOCK_PATH       # stock-on-hand snapshot read when STOCK_SOURCE=file (default current_stock.csv)
       # - key: LEAD_TIME_DAYS   # PLACEHOLDER lead time (no supplier role yet), default 7
       #   value: "7"

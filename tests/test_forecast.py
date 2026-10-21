@@ -400,6 +400,44 @@ class InventoryActions(unittest.TestCase):
         finally:
             ip.STOCK_PATH = old
 
+    def test_live_stock_from_db_is_cached_and_survives_a_failed_refresh(self):
+        import pandas as pd
+        import inventory_forecasting as f
+        import inventory_planning as ip
+        a = f.get_product_demand(horizon=1, top=1)["products"][0]["msku"]
+        calls, db_down = [], [False]
+
+        def fake_query():
+            calls.append(1)
+            if db_down[0]:
+                raise OSError("connection refused")
+            return pd.DataFrame({"MSKU": [a, None, "X"], "stock_on_hand": [7, 3, -1]})
+
+        saved = (ip.STOCK_SOURCE, ip._query_stock_table, dict(ip._live_cache))
+        ip.STOCK_SOURCE, ip._query_stock_table = "db", fake_query
+        ip._live_cache.update(data=None, next_read=0.0)
+        try:
+            stock, as_of, q = ip.load_stock()
+            self.assertEqual(stock.loc[a, "stock_on_hand"], 7)
+            self.assertEqual(q["rows_skipped_invalid"], 2)                # a NULL sku and negative stock are dropped
+            ip.load_stock()
+            self.assertEqual(len(calls), 1)                               # second call within the cache window: no query
+            ip._live_cache["next_read"] = 0.0                             # cache expired, refresh fails -> last good read
+            db_down[0] = True
+            with self.assertLogs("inventory_planning", "ERROR"):
+                again = ip.load_stock()
+            self.assertIs(again, ip._live_cache["data"]); self.assertEqual(len(calls), 2)
+            r = ip.get_inventory_actions(horizon=1)
+            self.assertEqual(r["stock_source"], "database (live)"); self.assertFalse(r["stock_stale"])
+            ip._live_cache.update(data=None, next_read=0.0)               # failure with nothing cached -> 503-style error
+            with self.assertLogs("inventory_planning", "ERROR"), self.assertRaises(ip.StockUnavailable) as e:
+                ip.load_stock()
+            self.assertNotIn("refused", str(e.exception))                 # connection details never reach the caller
+            self.assertGreater(ip.load_stock(str(ROOT / "current_stock.sample.csv"))[2]["rows_used"], 0)  # an explicit path still reads the file
+        finally:
+            ip.STOCK_SOURCE, ip._query_stock_table = saved[0], saved[1]
+            ip._live_cache.clear(); ip._live_cache.update(saved[2])
+
     def test_sample_snapshot_and_endpoints(self):
         import forecast_service
         import inventory_planning as ip
