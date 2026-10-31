@@ -32,7 +32,7 @@ Current held-out result (demand, 2026-07 to 2026-09): MAE 17.88 units, RMSE 24.9
 
 ## How revenue is forecast
 
-One learned model: the XGBoost demand model (units per category and month). **Revenue = predicted units x expected unit price**, where the expected price is the mean of the category's last 3 monthly average prices, held flat over the 1-3 month horizon (`inventory_forecasting.expected_unit_price`; the retrain scores exactly this rule). A separate XGBoost revenue model was retired: on the same held-out months it had 35.0% WAPE (285% on the lower-volume half of the categories) against 18.7% for this rule, and its month-to-month recursion compounded errors. Price *changes* are carried forward, not predicted. The 6-month average of revenue (13.5% WAPE) is still better on these 3 test months: revisit a learned revenue model with 24+ months of data. `xgb_monthly_revenue_model.json` is no longer used or produced.
+One learned model: the XGBoost demand model (units per category and month). **Revenue = predicted units x expected unit price**, where the expected price is the mean of the category's last 3 monthly average prices, held flat over the 1-3 month horizon (`inventory_trends.expected_unit_price`; the retrain scores exactly this rule). A separate XGBoost revenue model was retired: on the same held-out months it had 35.0% WAPE (285% on the lower-volume half of the categories) against 18.7% for this rule, and its month-to-month recursion compounded errors. Price *changes* are carried forward, not predicted. The 6-month average of revenue (13.5% WAPE) is still better on these 3 test months: revisit a learned revenue model with 24+ months of data. `xgb_monthly_revenue_model.json` is no longer used or produced.
 
 ## Growth and inventory actions
 

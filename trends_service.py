@@ -12,7 +12,7 @@ from flask import Flask, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 load_dotenv(Path(__file__).parent / ".env")
-import inventory_forecasting as forecast  # noqa: E402  (after load_dotenv so HISTORY_PATH etc. are read)
+import inventory_trends as forecast  # noqa: E402  (after load_dotenv so HISTORY_PATH etc. are read)
 import inventory_planning as planning  # noqa: E402
 
 API_KEY = os.environ.get("FORECAST_API_KEY", "")

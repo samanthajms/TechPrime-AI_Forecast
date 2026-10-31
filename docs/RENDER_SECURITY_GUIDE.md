@@ -93,14 +93,14 @@ Render terminates TLS and redirects HTTP → HTTPS on `onrender.com` and custom 
 ### 4.1 What is already enforced in code
 | Control | Where |
 |---|---|
-| API key on every route but `/health`, constant-time compare | `forecast_service.py` |
-| Separate admin key for `/api/reload`, disabled when unset | `forecast_service.py` |
-| Lockout after repeated bad keys, per-IP rate limit, stricter reload limit | `forecast_service.py` |
-| `horizon` must be 1, 2 or 3 (HTTP 400 otherwise); `category` ≤ 80 chars, `top` clamped | service + `inventory_forecasting.check_horizon` |
-| Generic error bodies (details only in server logs), JSON 404/405/413 | `forecast_service.py` |
+| API key on every route but `/health`, constant-time compare | `trends_service.py` |
+| Separate admin key for `/api/reload`, disabled when unset | `trends_service.py` |
+| Lockout after repeated bad keys, per-IP rate limit, stricter reload limit | `trends_service.py` |
+| `horizon` must be 1, 2 or 3 (HTTP 400 otherwise); `category` ≤ 80 chars, `top` clamped | service + `inventory_trends.check_horizon` |
+| Generic error bodies (details only in server logs), JSON 404/405/413 | `trends_service.py` |
 | No request bodies accepted (1 KB cap) | `MAX_CONTENT_LENGTH` |
-| Response headers: `no-store`, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, CSP `default-src 'none'`, HSTS | `forecast_service.py` |
-| Models are XGBoost **JSON** (no pickle → loading a model cannot execute code) | `inventory_forecasting.py` |
+| Response headers: `no-store`, `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, CSP `default-src 'none'`, HSTS | `trends_service.py` |
+| Models are XGBoost **JSON** (no pickle → loading a model cannot execute code) | `inventory_trends.py` |
 | Runtime-only dependencies (no DB driver / Excel reader on the web service) | `requirements.txt` |
 | gunicorn request-line / header size limits | `render.yaml` |
 

@@ -6,7 +6,7 @@ services:
     autoDeploy: true          # merging the monthly retrain PR redeploys the service with the new models
     buildCommand: pip install -r requirements.txt
     # One worker + threads: the in-process rate limiter and the model reload are per worker (see docs/RENDER_SECURITY_GUIDE.md)
-    startCommand: gunicorn forecast_service:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120 --limit-request-line 4094 --limit-request-field_size 8190
+    startCommand: gunicorn trends_service:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120 --limit-request-line 4094 --limit-request-field_size 8190
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION

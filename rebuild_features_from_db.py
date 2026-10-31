@@ -3,7 +3,7 @@ rebuild_features_from_db.py
 ============================
 Pulls REAL sales transactions from the live TechPrime-AI database and turns
 them into a fresh preprocessed_monthly_features.csv -- the same file
-rebuild_models_v2.py trains on and inventory_forecasting.py reads for
+rebuild_models_v2.py trains on and inventory_trends.py reads for
 inference-time features.
 
 In plain terms: this is the "top-up" script. Run it, and it ADDS whatever has
@@ -99,7 +99,7 @@ _POS_MONTH = "date_trunc('month', (s.created_at AT TIME ZONE 'UTC') AT TIME ZONE
 _THIS_MONTH_START = "date_trunc('month', now() AT TIME ZONE 'Asia/Manila')::date"
 
 # Column order must match the existing CSV exactly -- rebuild_models_v2.py
-# and inventory_forecasting.py both expect these names.
+# and inventory_trends.py both expect these names.
 OUTPUT_COLUMNS = [
     'Month', 'Category', 'units_sold', 'revenue', 'avg_price',
     'lag_1', 'lag_2', 'lag_3', 'lag_12', 'roll_mean_3', 'roll_mean_6', 'roll_std_3',
@@ -271,7 +271,7 @@ def build_full_grid(monthly: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------
 # Step 3: compute the lag / rolling-average feature columns
 # (same formulas as _build_demand_features / _build_revenue_features
-# in inventory_forecasting.py, applied across the whole history instead
+# in inventory_trends.py, applied across the whole history instead
 # of just "the next month")
 # -----------------------------------------------------------------
 def add_features(full: pd.DataFrame) -> pd.DataFrame:

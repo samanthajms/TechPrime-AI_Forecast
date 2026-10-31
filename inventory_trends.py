@@ -1,5 +1,5 @@
 """
-inventory_forecasting.py
+inventory_trends.py
 =========================
 Drop-in module for integrating the monthly XGBoost demand + revenue
 forecasting models into an inventory system.

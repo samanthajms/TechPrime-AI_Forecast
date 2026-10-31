@@ -1,1 +1,1 @@
-from forecast_service import app  # noqa: F401
+from trends_service import app  # noqa: F401

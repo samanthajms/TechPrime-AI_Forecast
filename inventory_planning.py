@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 
 import category_alignment as ca
-import inventory_forecasting as f
+import inventory_trends as f
 
 BASE_DIR = Path(__file__).parent
 

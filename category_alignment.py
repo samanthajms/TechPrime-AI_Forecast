@@ -7,7 +7,7 @@ Bridges the two category vocabularies used by TechPrime AI:
                       LABELS (Memory, Monitor, CPU Cooling, ...). Mirrors ep_shop_taxonomy() in
                       TechPrime-AI/includes/client_shop_taxonomy.php - KEEP THE TWO IN SYNC.
 
-Public API used by inventory_forecasting.py:
+Public API used by inventory_trends.py:
   classify_product(msku, product_name, model_category) -> (parent_key, shop_group, shop_label)
   resolve_filter(value) -> ('label'|'group'|'model', canonical_value)      # raises ValueError if unknown
   taxonomy()            -> {'groups': {group: [labels]}}

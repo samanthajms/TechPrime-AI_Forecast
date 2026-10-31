@@ -15,7 +15,7 @@ os.environ["AUTH_FAIL_LIMIT"] = "3"
 
 class Horizon(unittest.TestCase):
     def test_only_1_to_3(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         for ok in (1, 2, 3):
             self.assertEqual(f.check_horizon(ok), ok)
         for bad in (0, 4, 6, -1, "2", 2.0, True, None):
@@ -23,7 +23,7 @@ class Horizon(unittest.TestCase):
                 f.check_horizon(bad)
 
     def test_forecast_months_follow_history_cutoff(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         try:
             os.environ["HISTORY_CUTOFF"] = "2026-05"
             f.reload_history()
@@ -53,10 +53,10 @@ class Split(unittest.TestCase):
 
 class Service(unittest.TestCase):
     def setUp(self):
-        import forecast_service
-        importlib.reload(forecast_service)
-        self.svc = forecast_service
-        self.c = forecast_service.app.test_client()
+        import trends_service
+        importlib.reload(trends_service)
+        self.svc = trends_service
+        self.c = trends_service.app.test_client()
         self.h = {"X-API-Key": "test-key"}
 
     def test_health_open_everything_else_needs_key(self):
@@ -179,7 +179,7 @@ class FeatureBuilder(unittest.TestCase):
 
     def test_training_features_match_inference_features(self):
         import pandas as pd
-        import inventory_forecasting as f
+        import inventory_trends as f
         import rebuild_features_from_db as r
         units = [12, 7, 30, 18, 25, 9, 41, 22, 15]
         feats = r.add_features(self._grid(units)).iloc[-1]                  # row for the 9th month
@@ -215,7 +215,7 @@ class SystemCategories(unittest.TestCase):
         self.assertTrue((f["Category"].map(ca.group_of) == f["Category Group"]).all())
 
     def test_forecast_by_label_group_and_any_case(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         a = f.get_forecast(category="Memory", horizon=2)
         self.assertEqual(len(a), 2)
         self.assertEqual(f.get_forecast(category="MEMORY", horizon=2), a)       # case-insensitive
@@ -224,7 +224,7 @@ class SystemCategories(unittest.TestCase):
         self.assertGreater(grp[0]["predicted_units"], a[0]["predicted_units"])
 
     def test_demand_screen_has_total_that_matches_category_sum(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         d = f.get_product_demand(horizon=2, top=100000)
         self.assertEqual(len(d["total"]), 2)
         total_units = sum(m["predicted_units"] for m in d["total"])
@@ -233,7 +233,7 @@ class SystemCategories(unittest.TestCase):
         self.assertAlmostEqual(mem["total"][0]["predicted_units"], f.get_forecast(category="Memory", horizon=1)[0]["predicted_units"], places=0)
 
     def test_metrics_endpoint_has_study_metrics(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         m = f.get_model_metrics()
         for target in ("demand", "revenue"):
             for k in ("mae", "rmse", "wape_pct", "nrmse_pct", "bias_pct", "total_level_mape_pct",
@@ -252,7 +252,7 @@ class LiveCategoryNames(unittest.TestCase):
 
 class RevenueFromUnits(unittest.TestCase):
     def test_revenue_is_units_times_flat_expected_price(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         rows = f.get_forecast(category="model:Memory", horizon=3)
         series = f._monthly_series("Memory")
         price = f.expected_unit_price(series)
@@ -261,12 +261,12 @@ class RevenueFromUnits(unittest.TestCase):
             self.assertAlmostEqual(r["predicted_revenue"], r["predicted_units"] * price, delta=price * 0.06 + 0.01)
 
     def test_no_revenue_model_file_or_feedback(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         self.assertFalse(hasattr(f, "_revenue_model"))
         self.assertFalse((ROOT / "xgb_monthly_revenue_model.json").exists())
 
     def test_small_categories_stay_near_their_real_revenue(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         h = f._history()
         last3 = h[h["Month"].isin(sorted(h["Month"].unique())[-3:])]
         actual = last3.groupby("Shop Category")["revenue"].sum() / 3                          # typical monthly revenue
@@ -278,13 +278,13 @@ class RevenueFromUnits(unittest.TestCase):
                 self.assertLess(row["predicted_revenue"], base * 5, row["category"])           # the old model forecast CCTV at 15x
 
     def test_metrics_say_how_revenue_is_made(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         self.assertIn("units", f.get_model_metrics()["revenue"]["method"])
 
 
 class MonthOverMonth(unittest.TestCase):
     def test_pct_and_chain(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         self.assertEqual(f._pct(110, 100), 10.0)
         self.assertEqual(f._pct(50, 100), -50.0)
         self.assertIsNone(f._pct(5, 0))                                  # growth from nothing is undefined, not infinite
@@ -295,7 +295,7 @@ class MonthOverMonth(unittest.TestCase):
         self.assertEqual([r["revenue_mom_pct"] for r in out], [25.0, 10.0])
 
     def test_revenue_forecast_growth_matches_history_and_ignores_display_range(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         full = f.get_revenue_forecast(horizon=2)
         ranged = f.get_revenue_forecast(horizon=2, start="2026-01", end="2026-03")
         self.assertEqual(full["growth"], ranged["growth"])               # from/to only limits the chart history
@@ -308,7 +308,7 @@ class MonthOverMonth(unittest.TestCase):
             self.assertIn("units_mom_pct", row); self.assertIn("revenue_mom_pct", row)
 
     def test_demand_screen_total_has_mom(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         t = f.get_product_demand(horizon=2, top=1)["total"]
         self.assertTrue(all("units_mom_pct" in m for m in t))
 
@@ -325,7 +325,7 @@ class AbcClassification(unittest.TestCase):
         self.assertNotIn("zero", t.index); self.assertNotIn("neg", t.index)                  # no positive revenue -> no class
 
     def test_real_history_split_and_demand_rows_carry_class(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         a = f.get_abc(top=5)
         shares = {s["class"]: s["revenue_share_pct"] for s in a["summary"]}
         self.assertGreaterEqual(shares["A"], 80.0); self.assertAlmostEqual(sum(shares.values()), 100.0, delta=0.2)
@@ -364,7 +364,7 @@ class InventoryActions(unittest.TestCase):
         return fh.name
 
     def test_snapshot_cleaning_and_missing_file(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         import inventory_planning as ip
         top = f.get_abc(top=3)["products"]
         a, b, c = (p["msku"] for p in top)
@@ -379,7 +379,7 @@ class InventoryActions(unittest.TestCase):
             ip.load_stock("/no/such/stock.csv")
 
     def test_actions_use_snapshot_lead_time_then_request_override_and_flag_staleness(self):
-        import inventory_forecasting as f
+        import inventory_trends as f
         import inventory_planning as ip
         a = f.get_product_demand(horizon=1, top=1)["products"][0]["msku"]
         path = self._stock_file(f"MSKU,stock_on_hand,on_order,lead_time_days,snapshot_at\n{a},40,0,21,2020-01-01T00:00:00+00:00\nNOPE-999,5,0,,\n")
@@ -402,7 +402,7 @@ class InventoryActions(unittest.TestCase):
 
     def test_live_stock_from_db_is_cached_and_survives_a_failed_refresh(self):
         import pandas as pd
-        import inventory_forecasting as f
+        import inventory_trends as f
         import inventory_planning as ip
         a = f.get_product_demand(horizon=1, top=1)["products"][0]["msku"]
         calls, db_down = [], [False]
@@ -439,10 +439,10 @@ class InventoryActions(unittest.TestCase):
             ip._live_cache.clear(); ip._live_cache.update(saved[2])
 
     def test_sample_snapshot_and_endpoints(self):
-        import forecast_service
+        import trends_service
         import inventory_planning as ip
-        importlib.reload(forecast_service)
-        c, h = forecast_service.app.test_client(), {"X-API-Key": "test-key"}
+        importlib.reload(trends_service)
+        c, h = trends_service.app.test_client(), {"X-API-Key": "test-key"}
         old = ip.STOCK_PATH
         try:
             ip.STOCK_PATH = ROOT / "no-such-stock.csv"

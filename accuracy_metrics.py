@@ -1,7 +1,7 @@
 """
 accuracy_metrics.py
 ===================
-Forecast-accuracy metrics shared by rebuild_models_v2.py (retrain report) and inventory_forecasting.py (/api/metrics).
+Forecast-accuracy metrics shared by rebuild_models_v2.py (retrain report) and inventory_trends.py (/api/metrics).
 
 All functions take a DataFrame / arrays of ACTUAL and PREDICTED values for held-out months.
 
